@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+    - name: "Synth bug"
+      url: "https://github.com/spessasus/spessasynth_core/issues"
+      about: "Playback bugs that also happen with other banks go to spessasynth_core."
