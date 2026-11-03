@@ -64,8 +64,8 @@ Presets carry the full voice names (Grand Piano), instruments the 8 character na
 (GrandPno 1).
 
 Banks: XG voices on bank MSB 0 with the variation number as bank LSB (SFE's extended bank field), SFX voices on
-MSB 64, drum kits on MSB 127, SFX kits on MSB 126, and GS copies of the kits on MSB 128. The bank plays about
-7 dB below the plugin, so that every voice keeps its level relative to the others.
+MSB 64, drum kits on MSB 127, SFX kits on MSB 126, and GS copies of the kits as GM/GS drum presets (bank 128 in
+SF2). The bank plays about 7 dB below the plugin, so that every voice keeps its level relative to the others.
 
 ## Design choices
 

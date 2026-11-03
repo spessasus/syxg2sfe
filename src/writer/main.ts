@@ -750,8 +750,8 @@ for (const p of bank.presets) {
     soundBank.addPresets(preset);
 }
 
-// GS drum aliases on bank MSB 128. The XG kits already use the GS program numbers, SFX 1 takes the GS SFX
-// set slot (56) since program 0 is the Standard Kit there. SFX 2 has no GS slot.
+// GS drum aliases (isGMGSDrum, the SF2 bank 128). The XG kits already use the GS program numbers, SFX 1 takes
+// the GS SFX set slot (56) since program 0 is the Standard Kit there. SFX 2 has no GS slot.
 for (const p of bank.presets) {
     if (!p.drum) continue;
     const program = p.msb === 127 ? p.program : p.program === 0 ? 56 : -1;
@@ -759,8 +759,7 @@ for (const p of bank.presets) {
     const preset = new BasicPreset(soundBank);
     preset.name = `${p.name} GS`;
     preset.program = program;
-    preset.bankMSB = 128;
-    preset.bankLSB = 0;
+    preset.isGMGSDrum = true;
     for (const e of p.elements) {
         const zone = preset.createZone(instruments[e.instrument]);
         if (e.key !== undefined) zone.keyRange = { min: e.key, max: e.key };
