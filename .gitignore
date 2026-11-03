@@ -1,0 +1,15 @@
+# Only the converter is tracked. The reverse engineering workspace, notes, test material and outputs stay local.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/build.py
+!/package.json
+!/package-lock.json
+!/tsconfig.json
+!/src/
+!/input/
+/input/*
+!/input/README.md
+
+__pycache__/

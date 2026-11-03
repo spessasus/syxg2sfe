@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Build the SFE bank of one S-YXG50 DLL.
+
+python3 build.py [--dll input/syxg50.dll] [--output .] [--full] [--name "S-YXG50"]
+
+Writes <dll name>.sf4 and <dll name>_vorbis.sf4 to --output (default: the current folder). The data of each DLL
+(ROM tables, measurements, bank.json) lives in build/<dll name>/, so several DLLs can be built side by side.
+
+Steps, each skipped when its output is already there (--full redoes all of them):
+1. Extract the voice table and the wave data from the DLL (src/convert/extract_rom.py).
+2. Measure every voice element and drum note in the DLL under Wine (src/convert/collect.py, collect_vel.py). It
+   needs Wine and the VST host (src/host/harness.c, built into build/harness.exe with i686-w64-mingw32-gcc when
+   missing or older than its source).
+3. Fit the SF2 values (src/convert/convert.py), then write the banks (src/writer/main.ts, needs ffmpeg with
+   libvorbis).
+The filter map (src/convert/filtermap.py, the chip filter, the same in every DLL) goes to build/filter_map.json once,
+--full redoes it.
+"""
+import argparse, json, os, subprocess, sys, time
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+CONVERT = os.path.join(ROOT, 'src', 'convert')
+HOST = os.path.join(ROOT, 'src', 'host', 'harness.c')
+
+
+def step(name, cmd, cwd=ROOT, env=None):
+    print('== %s' % name, flush=True)
+    t = time.time()
+    subprocess.run(cmd, cwd=cwd, check=True, stdin=subprocess.DEVNULL, env=env)
+    print('   done in %.0f s' % (time.time() - t), flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[1], formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog='\n'.join(__doc__.split('\n')[2:]))
+    ap.add_argument('--dll', '--input', default=os.path.join(ROOT, 'input', 'syxg50.dll'), help='the plugin DLL')
+    ap.add_argument('--output', default=os.getcwd(), help='folder for the .sf4 files (default: current folder)')
+    ap.add_argument('--full', action='store_true', help='redo every step, measurements included')
+    ap.add_argument('--name', help='bank name (default: S-YXG50, plus the ROM header for other builds)')
+    a = ap.parse_args()
+    dll = os.path.abspath(a.dll)
+    if not os.path.exists(dll): sys.exit('%s missing: copy the S-YXG50 VST2 DLL there' % dll)
+    stem = os.path.splitext(os.path.basename(dll))[0]
+    data = os.path.join(ROOT, 'build', stem)
+    env = dict(os.environ, SYXG_DLL=dll, SYXG_DATA=data)
+    py = sys.executable
+    have = lambda f: os.path.exists(os.path.join(data, f))
+    newer = lambda f, than: os.path.getmtime(f) > os.path.getmtime(than)
+
+    # resources.json from before the wave base was stored there: the converter fell back to the original's base
+    # (MU80 samples 327272 bytes off, past the end of the wave data)
+    stale = have('resources.json') and 'waveBase' not in json.load(open(os.path.join(data, 'resources.json')))
+    if a.full or stale or not have('voice.tbl') or newer(dll, os.path.join(data, 'voice.tbl')):
+        step('ROM tables', [py, os.path.join(CONVERT, 'extract_rom.py')], env=env)
+    if a.full or not have('measure.json') or not have('measure_vel.json'):
+        exe = os.path.join(ROOT, 'build', 'harness.exe')
+        if not os.path.exists(exe) or newer(HOST, exe):
+            # The VST2 host the DLL runs in under Wine (32-bit)
+            os.makedirs(os.path.dirname(exe), exist_ok=True)
+            step('build harness', ['i686-w64-mingw32-gcc', '-O2', '-Wall', '-o', exe, HOST])
+        step('measure (Wine, slow)', [py, os.path.join(CONVERT, 'collect.py')], env=env)
+        step('measure velocity 64', [py, os.path.join(CONVERT, 'collect_vel.py')], env=env)
+    if a.full or not os.path.exists(os.path.join(ROOT, 'build', 'filter_map.json')):
+        step('filter map', [py, os.path.join(CONVERT, 'filtermap.py')], env=env)
+    step('fit voices', [py, os.path.join(CONVERT, 'convert.py')], env=env)
+    header = json.load(open(os.path.join(data, 'resources.json')))['header']
+    name = a.name or ('S-YXG50' if header.startswith('MU50 4MB') else 'S-YXG50 (%s)' % header)
+    step('write banks', ['npx', 'tsx', os.path.join('src', 'writer', 'main.ts'), data, os.path.abspath(a.output), stem, name], env=env)
+
+
+if __name__ == '__main__':
+    main()
