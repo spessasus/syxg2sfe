@@ -699,8 +699,9 @@ def element_zones(tid):
     # (pitch_eg_job). Elements with firmware random pitch steps (element byte 0x05 bit 1) keep the bake.
     if ref and ps and len(ps) >= 2:
         random_steps = bool(el is not None and el[0x05] & 2)
+        vel_seq = [(b, v) for b, v in (VEL_LONG.get(tid) or {}).get('0x680', []) if ignores_off or b < 1035]
         peg_job = ([(b, v) for b, v in r['long']['0x680'] if ignores_off or b < 1035], ref['eg'], amp_delay,
-                   not ignores_off, L_steady, random_steps, pitch_curve)
+                   not ignores_off, L_steady, random_steps, pitch_curve, vel_seq if len(vel_seq) >= 2 else None, TARGETS[tid]['vel'])
     return zones, {'ampDelay': amp_delay, 'ampLfo': amp_lfo, 'filterLfo': filter_lfo, 'saw': saw, 'maxFc': max_fc,
                    'maxFcCC71': max_fc_cc71, 'velRef': vref, 'velocity': vel_mod, 'velocity2': vel_mod2,
                    'velocityFc': vfc_mod, 'velocityQ': vq_mod, 'filterEG': feg_job, 'pitchEG': peg_job, 'cc71': cc71,
@@ -845,14 +846,17 @@ def key_eg(scaling, key):
 # PEG_BAKE_CENTS.
 PEG_FIT_CENTS = 25
 PEG_BAKE_CENTS = 10
+PEG_VEL_MIN_CENTS = 15
+PEG_VEL_MIN_RATIO = 0.15
 
 def pitch_eg_job(job):
     """modEnv2 generators for one element's pitch EG, plus the tuning offset for the zones (cents), or None for a
     flat pitch. 'bake' when the envelope cannot draw it."""
     if job is None: return None
-    seq, eg, delay, releases, steady, random_steps, curve = job
+    seq, eg, delay, releases, steady, random_steps, curve, seq_vel, lvel = job
     if random_steps: return {'bake': True}
-    f = fit_filter_eg(seq, pitch_cents, eg, shift=delay, releases=releases, flat=8, ref=steady, core_times=True)
+    f = fit_filter_eg(seq, pitch_cents, eg, seq_vel, 0.0 if seq_vel else None, shift=delay, releases=releases, flat=8,
+                      ref=steady, core_times=True)
     if not f or not f['amount']: return {'bake': True} if curve else None
     good = f['rms'] <= PEG_FIT_CENTS or f['rms'] <= 0.5 * f['rms0']
     if curve and f['rms'] > PEG_BAKE_CENTS: return {'bake': True}
@@ -862,7 +866,13 @@ def pitch_eg_job(job):
     # bakes before) keeps gliding, at 12.5 s the pitch stayed up and the one-shot sample ran out early (Cybergate
     # ch 15 dev 1.2 -> 4.5). The release goes on at the decay's rate.
     if f['sustain'] < 0.05: f['release'] = f['decay']
-    return {'delayModEnv2': seconds_to_timecents(f['delay']), 'attackModEnv2': seconds_to_timecents(f['attack']),
+    # Depth that follows the velocity: the velocity 64 long note against the one at lvel, a linear modulator
+    # (velocity -> depth) fitted at that one point
+    vel = {}
+    if 'vel_depth' in f and abs(f['vel_depth']) >= PEG_VEL_MIN_CENTS and abs(f['vel_depth']) >= PEG_VEL_MIN_RATIO * abs(f['amount']):
+        at64 = vel_x('linear', VEL_LONG_VELOCITY) - vel_x('linear', lvel)
+        vel = {'velocityDepth': ['linear', -f['vel_depth'] / at64], 'velRef': lvel}
+    return {**vel, 'delayModEnv2': seconds_to_timecents(f['delay']), 'attackModEnv2': seconds_to_timecents(f['attack']),
             'holdModEnv2': seconds_to_timecents(f['hold']), 'decayModEnv2': seconds_to_timecents(f['decay']),
             'sustainModEnv2': round(1000 * (1 - f['sustain'])), 'releaseModEnv2': seconds_to_timecents(f['release']),
             'modEnv2ToPitch': round(f['amount']), 'tune': f['y0'] + f['base'] - steady,
@@ -881,7 +891,7 @@ def main():
         # Pitch: the envelope, or (moving too much for it) the measured curve baked into copies of the sample,
         # relative to the steady pitch the zones use. A baked curve speeds up and slows down with the key, so
         # the bakes go in key windows (bake_windows).
-        curve = glob['pitchEG'][-1] if glob['pitchEG'] else None
+        curve = glob['pitchEG'][6] if glob['pitchEG'] else None
         glob['pitchEG'] = None
         if peg and peg.get('bake') and curve:
             for z in zones: z['pitchCurve'] = curve
@@ -889,6 +899,9 @@ def main():
         elif peg and not peg.get('bake'):
             tune = peg.pop('tune')
             for z in zones: z['tuneCents'] += tune
+            # The generator holds the depth at the long note's velocity, the modulator takes away what it adds there
+            if 'velocityDepth' in peg:
+                peg['modEnv2ToPitch'] = round(peg['modEnv2ToPitch'] + vel_at127(peg['velocityDepth'], peg.pop('velRef')))
             glob['pitchEG'] = peg
         glob['filterEG'] = feg
         scaling = key_eg_scaling(tid) if feg and feg['modEnvToFilterFc'] else None

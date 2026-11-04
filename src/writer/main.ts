@@ -103,6 +103,7 @@ interface PitchEnvelope {
     sustainModEnv2: number;
     releaseModEnv2: number;
     modEnv2ToPitch: number;
+    velocityDepth?: CurveFit;
 }
 
 interface BankInstrument {
@@ -559,6 +560,8 @@ const instruments = bank.instruments.map((inst) => {
         gen(g, GeneratorTypes.sustainModEnv2, peg.sustainModEnv2);
         gen(g, GeneratorTypes.releaseModEnv2, peg.releaseModEnv2);
         gen(g, GeneratorTypes.modEnv2ToPitch, peg.modEnv2ToPitch);
+        // Some pitch EGs scale their depth with velocity
+        addVelocityModulator(g, peg.velocityDepth, GeneratorTypes.modEnv2ToPitch, -1);
     }
     // Cutoff ceiling of the DLL filter at the element's resonance, CC71 moves it with the resonance
     if (inst.global.maxFc < 13_500) gen(g, GeneratorTypes.maxFilterFc, inst.global.maxFc);
