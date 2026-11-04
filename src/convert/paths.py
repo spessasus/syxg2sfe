@@ -12,6 +12,7 @@ WAVE_PCM = os.path.join(DATA, 'wave.pcm')
 RESOURCES = os.path.join(DATA, 'resources.json')
 MEASURE = os.path.join(DATA, 'measure.json')
 MEASURE_VEL = os.path.join(DATA, 'measure_vel.json')
+MEASURE_KEY = os.path.join(DATA, 'measure_key.json')
 BANK = os.path.join(DATA, 'bank.json')
 # Worker processes for the slow steps (measuring, fitting, Vorbis). Few by default, so the machine stays usable.
 JOBS = max(1, int(os.environ.get('SYXG_JOBS') or 3))

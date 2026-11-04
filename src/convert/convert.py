@@ -805,6 +805,41 @@ def filter_eg_job(job):
             'releaseModEnv': seconds_to_timecents(f['release']), 'modEnvToFilterFc': round(f['amount']),
             'base': f['base'], 'rms': round(f['rms']), 'span': round(f['span'])}
 
+_KEY_PATH = os.path.join(os.path.dirname(MEASURE), 'measure_key.json')
+KEY_LONG = json.load(open(_KEY_PATH)) if os.path.exists(_KEY_PATH) else {}
+DEPTH_MIN_CENTS = 300
+DEPTH_RATIO_MIN, DEPTH_RATIO_MAX = 0.25, 3.0
+DEPTH_RATIO_NEAR_1 = 0.12
+FC_OPEN = 13400
+
+def key_eg_scaling(tid):
+    """[(key, depth ratio, cutoff shift in cents)] of the filter EG at the ends of the element's key range against the
+    center key's, from the long notes there (collect_key.py), None where nothing differs.
+    Only where both note-ons are below the map's open filter (13500): the depth (cutoff move from note-on to the end
+    of the hold) scales and the whole sweep scales with it. At the cap the true start is hidden and the depth
+    unknown. A shift of the sweep by the settled cutoff there was tried and broke Grand Piano (0.3 -> 4.4 dB)."""
+    ks = KEY_LONG.get(tid)
+    if not ks: return None
+    fc = lambda v: filter_match(*filter_regs({'0x400': v}))[0]
+    ends = lambda seq: None if len(seq) < 3 else (fc(seq[0][1]), fc(seq[-1][1]))
+    cen = ends([(b, v) for b, v in RES[tid]['long']['0x400'] if b < 690])
+    if cen is None: return None
+    out = [(TARGETS[tid]['center'], 1.0, 0.0)]
+    for k, w in ks.items():
+        e = ends([(b, v) for b, v in (w or {}).get('0x400', []) if b < 690])
+        r, shift = 1.0, 0.0
+        if e is not None:
+            if cen[0] < FC_OPEN and e[0] < FC_OPEN and abs(cen[0] - cen[1]) >= DEPTH_MIN_CENTS and (e[0] - e[1]) * (cen[0] - cen[1]) > 0:
+                r = min(DEPTH_RATIO_MAX, max(DEPTH_RATIO_MIN, (e[0] - e[1]) / (cen[0] - cen[1])))
+        out.append((int(k), r, shift))
+    out.sort()
+    return out if any(abs(r - 1) > DEPTH_RATIO_NEAR_1 or sh for _, r, sh in out) else None
+
+def key_eg(scaling, key):
+    """(depth ratio, cutoff shift) at a key: linear between the measured keys, flat beyond them."""
+    ks = [k for k, _, _ in scaling]
+    return float(np.interp(key, ks, [r for _, r, _ in scaling])), float(np.interp(key, ks, [sh for _, _, sh in scaling]))
+
 # Pitch EG on the envelope where it fits within this (cents, loudness weighted RMS) or halves the error of a flat
 # pitch. Elements whose curve was baked before (the SFX sweeps) keep the exact bake unless the envelope is within
 # PEG_BAKE_CENTS.
@@ -856,12 +891,19 @@ def main():
             for z in zones: z['tuneCents'] += tune
             glob['pitchEG'] = peg
         glob['filterEG'] = feg
+        scaling = key_eg_scaling(tid) if feg and feg['modEnvToFilterFc'] else None
         if feg:
-            for z in zones: z['filterFc'] += feg['base']
+            for z in zones:
+                r, shift = key_eg(scaling, z['centerKey']) if scaling else (1, 0)
+                z['filterFc'] += feg['base'] * r + shift
             # The vel 64 long note replaces the note-on velocity fit (that one shifts the whole sweep)
             if 'velocityFc' in feg: glob['velocityFc'] = feg.pop('velocityFc')
             # The generator holds the velocity 127 depth, the modulator takes away what it adds at 127
-            feg['modEnvToFilterFc'] = round(feg['modEnvToFilterFc'] + vel_at127(feg.get('velocityDepth'), feg.pop('velRef')))
+            amount = feg['modEnvToFilterFc'] + vel_at127(feg.get('velocityDepth'), feg.pop('velRef'))
+            feg['modEnvToFilterFc'] = round(amount)
+            # The depth follows the key in some voices: zones at other keys take their own depth
+            if scaling:
+                for z in zones: z['modEnvToFilterFc'] = round(amount * key_eg(scaling, z['centerKey'])[0])
         # Same for the note-on velocity modulators (attenuation adds, cutoff and resonance subtract)
         for z in zones:
             z['attenuation'] -= vel_at127(glob['velocity'], glob['velRef']) + vel_at127(glob['velocity2'], glob['velRef'])

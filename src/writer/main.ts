@@ -44,6 +44,7 @@ interface BankZone {
     attSlope: number;
     pan: number;
     filterFc: number;
+    modEnvToFilterFc?: number;
     fcSlope: number;
     filterQ: number;
     centerKey: number;
@@ -625,6 +626,7 @@ const instruments = bank.instruments.map((inst) => {
         // Generators are 16 bit. The cutoff can sit above 13500 on purpose (the synth only caps the sum), but must
         // not wrap
         gen(zone, GeneratorTypes.initialFilterFc, Math.min(20_000, z.filterFc - fcSlope * (z.centerKey - 64)));
+        if (z.modEnvToFilterFc !== undefined) gen(zone, GeneratorTypes.modEnvToFilterFc, z.modEnvToFilterFc);
         if (z.brightness) addBrightness(zone, z.brightness);
         for (const [slope, destination] of [
             [attSlope, GeneratorTypes.initialAttenuation],

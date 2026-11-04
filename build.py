@@ -8,7 +8,7 @@ Writes <dll name>.sf4 and <dll name>_vorbis.sf4 to --output (default: the curren
 
 Steps, each skipped when its output is already there (--full redoes all of them):
 1. Extract the voice table and the wave data from the DLL (src/convert/extract_rom.py).
-2. Measure every voice element and drum note in the DLL under Wine (src/convert/collect.py, collect_vel.py). It
+2. Measure every voice element and drum note in the DLL under Wine (src/convert/collect.py, collect_vel.py, then collect_key.py for the filter EG at other keys). It
    needs Wine and the VST host (src/host/harness.c, built into build/harness.exe with i686-w64-mingw32-gcc when
    missing or older than its source).
 3. Fit the SF2 values (src/convert/convert.py), then write the banks (src/writer/main.ts, needs ffmpeg with
@@ -60,6 +60,8 @@ def main():
             step('build harness', ['i686-w64-mingw32-gcc', '-O2', '-Wall', '-o', exe, HOST])
         step('measure (Wine, slow)', [py, os.path.join(CONVERT, 'collect.py')], env=env)
         step('measure velocity 64', [py, os.path.join(CONVERT, 'collect_vel.py')], env=env)
+    if a.full or not have('measure_key.json'):
+        step('measure key ends', [py, os.path.join(CONVERT, 'collect_key.py')], env=env)
     if a.full or not os.path.exists(os.path.join(ROOT, 'build', 'filter_map.json')):
         step('filter map', [py, os.path.join(CONVERT, 'filtermap.py')], env=env)
     step('fit voices', [py, os.path.join(CONVERT, 'convert.py')], env=env)
