@@ -13,6 +13,8 @@ BLOCK = 128 / 44100
 NOTE_OFF = 690 * BLOCK
 END = (690 + 345) * BLOCK
 GRID = np.arange(0, END, 0.005)
+# ModulationEnvelope.tc2Sec: times of -10114 timecents (2.9 ms) or less are 0
+MIN_TIME = 2 ** (-10114 / 1200)
 
 
 def _convex(x):
@@ -20,8 +22,16 @@ def _convex(x):
     return np.clip(1 - (-400 / 960) * np.log10(x), 0, 1)
 
 
-def mod_env(t, delay, attack, hold, decay, sustain, release):
-    """spessasynth_core ModulationEnvelope.process on a time grid (times in seconds, decay/release full scale)."""
+def mod_env(t, delay, attack, hold, decay, sustain, release, note_off=NOTE_OFF, core_times=False):
+    """spessasynth_core ModulationEnvelope.process on a time grid (times in seconds, decay/release full scale).
+    core_times: times the core plays as 0 (MIN_TIME) are 0 here too. Without it a 1 ms attack starts the fit at env
+    0 on the first grid point, where the core is already at the peak, and that one point pushed Synth Drum
+    0/0/118's pitch glide (a straight 0.42 s fall) to a 21 cent RMS shape. The filter EG fits keep the old model:
+    with core times they fitted closer (FastResB 0/20/38 395 -> 89 cents RMS) but closed the filter too early at
+    the other keys, the songs got worse (Cybergate ch 13 3.6 -> 8.2, the filter EG is measured at one key)."""
+    if core_times:
+        z = lambda v: 0.0 if v <= MIN_TIME else v
+        delay, attack, hold = z(delay), z(attack), z(hold)
     a_end = delay + attack
     h_end = a_end + hold
     d_len = decay * (1 - sustain)
@@ -32,31 +42,28 @@ def mod_env(t, delay, attack, hold, decay, sustain, release):
     e = np.where(t < a_end, _convex((t - delay) / max(attack, 1e-9)), e)
     e = np.where(t < delay, 0.0, e)
     # Release from the level at note-off
-    pre = t < NOTE_OFF
-    lvl = np.interp(NOTE_OFF, t[pre], e[pre]) if pre.any() else 0.0
+    pre = t < note_off
+    lvl = np.interp(note_off, t[pre], e[pre]) if pre.any() else 0.0
     rd = max(release * lvl, 1e-9)
-    rel = np.clip(1 - (t - NOTE_OFF) / rd, 0, 1) * lvl
+    rel = np.clip(1 - (t - note_off) / rd, 0, 1) * lvl
     return np.where(pre, e, rel)
 
 
-# ModulationEnvelope.tc2Sec: times of -10114 timecents (2.9 ms) or less are 0
-MIN_TIME = 2 ** (-10114 / 1200)
 
-
-def core_env(t, delay, attack, hold, decay, sustain, release):
+def core_env(t, delay, attack, hold, decay, sustain, release, note_off=NOTE_OFF):
     """mod_env as the core runs it: computed once per 128 sample block (at the block start), short times are 0.
     A fitted attack of a few ms looks harmless on the 5 ms grid, but in the core the whole first block then sits
     at the env 0 cutoff (Stardust 0/68/102: open filter for 2.9 ms where the DLL starts at 59 Hz)."""
     z = lambda v: 0.0 if v <= MIN_TIME else v
     tq = np.floor(t / BLOCK) * BLOCK
-    return mod_env(tq, z(delay), z(attack), z(hold), z(decay), sustain, max(release, 2 ** (-7200 / 1200)))
+    return mod_env(tq, z(delay), z(attack), z(hold), z(decay), sustain, max(release, 2 ** (-7200 / 1200)), note_off)
 
 
-def trajectory(seq, to_cents):
-    """Step trajectory of the cutoff (cents) on GRID from the long note's 0x400 writes."""
+def trajectory(seq, to_cents, shift=0.0):
+    """Step trajectory (cents) on GRID from the long note's register writes, shift seconds after note-on."""
     bs = np.array([b * BLOCK for b, _ in seq])
     cs = np.array([to_cents(v) for _, v in seq])
-    idx = np.searchsorted(bs, GRID, side='right') - 1
+    idx = np.searchsorted(bs, GRID + shift, side='right') - 1
     return cs[np.clip(idx, 0, len(cs) - 1)]
 
 
@@ -65,17 +72,24 @@ def _unpack(p):
     return base, amount, math.exp(ld), math.exp(la), math.exp(lh), math.exp(ldc), sus, math.exp(lr)
 
 
-def vol_env_db(t, eg):
-    """Rough dB curve of the zone's SF2 volume envelope (timecents/cB as written to the bank)."""
+def vol_env_db(t, eg, note_off=NOTE_OFF):
+    """Rough dB curve of the zone's SF2 volume envelope (timecents/cB as written to the bank), both decays."""
     tc = lambda v: 0.0 if v <= -12000 else 2 ** (v / 1200)
     a, h, d, r = tc(eg['attackVolEnv']), tc(eg['holdVolEnv']), tc(eg['decayVolEnv']), tc(eg['releaseVolEnv'])
     sus = eg['sustainVolEnv'] / 10
+    sus2 = min(100.0, max(0.0, sus + eg.get('sustain2VolEnv', 0) / 10))
+    d2 = tc(eg.get('decay2VolEnv', -12000))
+    t1 = a + h + d * sus / 96
     db = np.where(t < a + h, 0.0, -np.minimum((t - a - h) / max(d, 1e-9) * 96, sus))
-    at_off = float(np.interp(NOTE_OFF, t, db))
-    return np.where(t < NOTE_OFF, db, at_off - (t - NOTE_OFF) / max(r, 1e-9) * 96)
+    if d2 and sus2 != sus:
+        step = np.clip((t - t1) / d2 * 96, 0, abs(sus2 - sus)) * (1 if sus2 > sus else -1)
+        db = np.where(t > t1, -(sus + step), db)
+    at_off = float(np.interp(note_off, t, db))
+    return np.where(t < note_off, db, at_off - (t - note_off) / max(r, 1e-9) * 96)
 
 
-def fit(seq, to_cents, eg=None, seq_vel=None, vel_fc=None):
+def fit(seq, to_cents, eg=None, seq_vel=None, vel_fc=None, shift=0.0, releases=True, flat=50, ref=None,
+        core_times=False):
     """Fitted envelope, relative to the cutoff at note-on: dict or None when the cutoff barely moves.
 
     eg (the zone's volume envelope) weights the error by loudness, so the audible part fits best.
@@ -83,25 +97,31 @@ def fit(seq, to_cents, eg=None, seq_vel=None, vel_fc=None):
     velocity, so with the envelope shape fixed, cutoff shift (vel_fc) and depth change (vel_depth) are a
     linear fit. The DLL rates are slopes, so a smaller depth also runs faster, which SF2 cannot follow.
     A given vel_fc (cents at seq_vel's velocity, from the note-on cutoffs) is kept and only the depth is fitted.
+    shift: seconds the voice starts after note-on (delayVoice), the firmware EG runs from note-on, the SF2 one
+    from the voice start. releases=False for notes that ignore note-off (no release in the bank either).
+    flat: below this span (cents) the curve counts as flat. ref (absolute cents): also report the error of a flat
+    line there (rms0), to judge whether the envelope helps.
     """
-    y = trajectory(seq, to_cents)
-    w = np.ones_like(GRID) if eg is None else np.maximum(10 ** (vol_env_db(GRID, eg) / 40), 0.01)
+    note_off = (NOTE_OFF if releases else 1e9) - shift
+    y = trajectory(seq, to_cents, shift)
+    w = np.ones_like(GRID) if eg is None else np.maximum(10 ** (vol_env_db(GRID, eg, note_off) / 40), 0.01)
     # Relative to the first write, which is what the zones use as the cutoff at note-on. Block 0 can hold a
     # second write (a 10 ms tick) and the grid only sees that one.
     y0 = to_cents(seq[0][1])
+    rms0 = None if ref is None else math.sqrt(float(np.sum(((y - ref) * w) ** 2)) / float(np.sum(w * w)))
     y = y - y0
-    pre = GRID < NOTE_OFF
-    if np.ptp(y[pre]) < 50:
+    pre = GRID < note_off
+    if np.ptp(y[pre]) < flat:
         # Flat, but maybe away from the first write: keep that as a static offset
         off = float(np.median(y[pre]))
         if abs(off) < 20: return None
         return {'base': off, 'amount': 0.0, 'delay': 0.001, 'attack': 0.001, 'hold': 0.001, 'decay': 0.001,
-                'sustain': 1.0, 'release': 0.001, 'rms': 0.0, 'span': 0.0}
+                'sustain': 1.0, 'release': 0.001, 'rms': 0.0, 'span': 0.0, 'rms0': rms0, 'y0': y0}
     lo, hi = y.min(), y.max()
 
     def resid(p):
         base, amount, d, a, h, dc, s, r = _unpack(p)
-        return (base + amount * mod_env(GRID, d, a, h, dc, s, r) - y) * w
+        return (base + amount * mod_env(GRID, d, a, h, dc, s, r, note_off, core_times) - y) * w
 
     ln = math.log
     lb = [lo - 2400, -12000, ln(1e-3), ln(1e-3), ln(1e-3), ln(1e-3), 0.0, ln(1e-3)]
@@ -125,16 +145,16 @@ def fit(seq, to_cents, eg=None, seq_vel=None, vel_fc=None):
     base, amount, d, a, h, dc, s, rel = _unpack(best.x)
     # The DLL often starts at the EG peak (base + amount), the fit then takes a short attack from base. Without the
     # attack the core starts there too.
-    cost = lambda d, a: float(np.sum(((base + amount * core_env(GRID, d, a, h, dc, s, rel) - y) * w) ** 2))
+    cost = lambda d, a: float(np.sum(((base + amount * core_env(GRID, d, a, h, dc, s, rel, note_off) - y) * w) ** 2))
     if a < 0.05 and cost(d, 0.0) < cost(d, a):
         a = 0.001
         if d < 0.05 and cost(0.0, a) < cost(d, a): d = 0.001
     err = math.sqrt(2 * best.cost / float(np.sum(w * w)))
     out = {'base': base, 'amount': amount, 'delay': d, 'attack': a, 'hold': h, 'decay': dc, 'sustain': s,
-           'release': rel, 'rms': err, 'span': float(np.ptp(y))}
+           'release': rel, 'rms': err, 'span': float(np.ptp(y)), 'rms0': rms0, 'y0': y0}
     if seq_vel:
-        e = mod_env(GRID, d, a, h, dc, s, rel)
-        yv = trajectory(seq_vel, to_cents) - y0 - base - amount * e
+        e = mod_env(GRID, d, a, h, dc, s, rel, note_off, core_times)
+        yv = trajectory(seq_vel, to_cents, shift) - y0 - base - amount * e
         if vel_fc is None:
             m = np.stack([np.ones_like(e), e], axis=1) * w[:, None]
             (kf, ka), *_ = np.linalg.lstsq(m, yv * w, rcond=None)

@@ -7,8 +7,8 @@ import json, math, os, sys
 import numpy as np
 from collections import defaultdict
 from rom import *
-from paths import MEASURE, MEASURE_VEL, BANK, FILTER_MAP, wave_base
-from fegfit import fit as fit_filter_eg
+from paths import MEASURE, MEASURE_VEL, BANK, FILTER_MAP, JOBS, wave_base
+from fegfit import fit as fit_filter_eg, vol_env_db
 from presets import melodic, KITS, KIT_NAMES, wave_records
 from chip import *
 from lfo import lfo_for, fit_halves, _curve
@@ -92,116 +92,76 @@ def cutoff_cents(c, r=0):
 def q_cb(r, c=0x7c0):
     return filter_match(c, r)[1]
 
-def amp_eg(on, off, long_seq=None, decay2=None, hold_extra=0.0):
-    """SF2 volume envelope (timecents/cB) fitted to the DLL segments."""
+# The long note is held this long (690 blocks)
+LONG_NOTE_S = 690 * BLOCK
+# The longest decay the core plays (the 8000 timecents generator limit), seconds per 96 dB
+MAX_DECAY = 2 ** (8000 / 1200)
+
+def amp_eg(on, off, decay2=None, decay1_wait=0.0, decay2_seen=True):
+    """SF2 volume envelope (timecents/cB) from the DLL segments: attack or hold, decay 1 to level 1 (decayVolEnv,
+    sustainVolEnv), decay 2 to level 2 (decay2VolEnv, sustain2VolEnv), release. decay1_wait: how much later than
+    the rates say the DLL starts decay 2 (z_hold). decay2_seen: the long note showed the decay 2 write (else it
+    comes from the element bytes)."""
     a_reg, a_lvl = on.get('0x4c0', 0x7f), on.get('0x4c1', 0)
     if a_reg & 0x80:
         attack, hold = attack_time(a_reg & 0x7f, a_lvl), 0.0
     else:
         attack, hold = 0.0, hold_time(a_reg & 0x7f)
     r1, l1 = on.get('0x500', 0x7f), on.get('0x501', 0)
-    segs = [(decay_db_per_s(r1), level_db(l1))]
-    if decay2: segs.append((decay_db_per_s(decay2[0]), level_db(decay2[1])))
-    # A decay 1 that is over within 30 ms ahead of a slower decay 2 is only an onset click (Orgel 0/64/10:
-    # 12.6 dB in 12 ms). One SF2 decay from 0 dB can't follow it and plays the whole note too loud, so its level
-    # goes to the zone attenuation and the decay is fitted to the rest.
-    offset, click = 0.0, 0.0
-    if decay2 and len(segs) == 2 and segs[0][0] > 0 and segs[0][1] > 0.5 and segs[0][1] / segs[0][0] < 0.03 \
-            and segs[1][1] > segs[0][1] + 0.5:
-        # The level holds there until decay 2 starts (decay 1 time plus the firmware's poll delay)
-        offset, click = segs[0][1], segs[0][1] / segs[0][0]
-        segs = [(segs[1][0], segs[1][1] - offset)]
-    decay, sustain, hold2 = fit_decay(segs, '0x500' in off)
-    hold2 += click
-    hold2 += hold_extra
+    rate1, level1 = decay_db_per_s(r1), min(level_db(l1), 100.0)
+    if decay2 and not decay2_seen and rate1 > 0 and level1 / rate1 > LONG_NOTE_S and decay_db_per_s(decay2[0]) > 200:
+        # Decay 1 outlasts the long note, so its decay 2 was never seen. A cut from the element bytes ended Thunder
+        # 64/0/33 at 2 s (a 900 dB/s fall after 1.8 dB), the DLL keeps rumbling in songs: decay 1 runs to silence.
+        # Slower ones are right (Xplosion 64/0/114: 40 dB/s after 2.8 s, the old fit found the same).
+        decay2, level1 = None, 100.0
+    # A decay 2 at rate 0x7e+ is a real segment too, it silences the element at once (Cutting Noise 64/0/1
+    # element 2 sustained at -1.2 dB without it)
+    rate2, level2 = (decay_db_per_s(decay2[0]), min(level_db(decay2[1]), 100.0)) if decay2 else (0.0, level1)
+    per96 = lambda rate: 96.0 / rate if rate > 0 else 100.0
+    # The DLL starts decay 2 later than decay 1 should end (median 24 ms, p90 85 ms: the firmware polls the chip,
+    # and the rate model is a bit fast on some). SF2 starts it right away, so decay 1 is stretched to end there.
+    d1 = level1 / rate1 if rate1 > 0 else 0.0
+    stretched = per96(rate1) * ((d1 + decay1_wait) / d1 if decay2 and d1 > 0 else 1.0)
+    offset = 0.0
+    if decay2 and level1 >= 0.5 and d1 < 0.03 and decay1_wait > d1:
+        # A decay 1 that is over within 30 ms, then the DLL holds that level until decay 2 (Orgel 0/64/10: 12.6 dB
+        # in 12 ms, then 0.2 s). Stretched, the note started 3 dB too loud. Its level goes to the zone attenuation,
+        # the rest is a hold and decay 2.
+        offset = level1
+        hold += d1 + decay1_wait
+        decay, sustain, decay2_time, sustain2 = per96(rate2), level2 - level1, None, 0.0
+        last_rate = rate2
+    elif decay2 and (level1 < 0.5 or (level1 <= 3 and (decay1_wait > d1 or stretched > MAX_DECAY))):
+        # Decay 1 to (nearly) 0 dB, slower than the generator goes or followed by a long wait: a hold until
+        # decay 2 starts. Car Pass 64/0/82 falls 0.56 dB in 1.1 s (160 s per 96 dB), the core clamps the decay at
+        # 101 s, so decay 2 came 0.6 s early.
+        hold += d1 + decay1_wait
+        decay, sustain, decay2_time, sustain2 = per96(rate2), level2, None, 0.0
+        last_rate = rate2
+    else:
+        decay = stretched
+        sustain = level1
+        decay2_time = per96(rate2) if decay2 and abs(level2 - level1) > 0.1 else None
+        sustain2 = level2 - level1 if decay2_time else 0.0
+        last_rate = rate2 if decay2_time else rate1
     if '0x500' not in off:
-        # No release (drums ignore note-off): keep the decay slope after note-off
-        # A decay 2 at rate 0x7e+ is the stop at the end of a one-shot sample, the sample ends there anyway
-        last = decay2[0] if decay2 and (decay2[0] & 0x7f) < 0x7e else r1
-        release = 96.0 / max(decay_db_per_s(last), 1e-6)
-        rate = None
+        # No release write (drums that ignore note-off, the bank sets ignoreNoteOff). The release only matters for
+        # cuts like All Notes Off then, keep the last slope.
+        release = per96(last_rate)
     else:
         rate = off['0x500'] & 0x7f
-    if rate is None:
-        pass
-    elif rate > 0x5f:
-        # Linear fade: seconds to silence from the sustain level, mapped to a similar dB slope
-        step = RELEASE_STEP[rate]
-        t = (0xff000 - min(0xff000, int((sustain + offset * 10) / 10 / OCT_DB * 65536))) / step * BLOCK
-        release = max(0.001, 4.3 * t)
-    else:
-        release = 96.0 / max(decay_db_per_s(rate, True), 1e-6)
-    return {'attackVolEnv': seconds_to_timecents(attack), 'holdVolEnv': seconds_to_timecents(hold + hold2),
-            'decayVolEnv': seconds_to_timecents(decay), 'sustainVolEnv': round(min(sustain, 1000)),
+        if rate > 0x5f:
+            # Linear fade: seconds to silence from the level the note sits at, mapped to a similar dB slope
+            step = RELEASE_STEP[rate]
+            t = (0xff000 - min(0xff000, int((offset + sustain + sustain2) / OCT_DB * 65536))) / step * BLOCK
+            release = max(0.001, 4.3 * t)
+        else:
+            release = 96.0 / max(decay_db_per_s(rate, True), 1e-6)
+    return {'attackVolEnv': seconds_to_timecents(attack), 'holdVolEnv': seconds_to_timecents(hold),
+            'decayVolEnv': seconds_to_timecents(decay), 'sustainVolEnv': round(min(sustain * 10, 1000)),
+            'decay2VolEnv': seconds_to_timecents(decay2_time) if decay2_time else -12000,
+            'sustain2VolEnv': round(max(-1440, min(1440, sustain2 * 10))),
             'releaseVolEnv': seconds_to_timecents(release), 'levelOffset': offset * 10}
-
-DECAY_FIT_SECONDS = 8.0
-
-def fit_decay(segs, sustain=False):
-    return _fit_decay(tuple(tuple(sg) for sg in segs), sustain)
-
-@lru_cache(maxsize=None)
-def _fit_decay(segs, allow_sustain):
-    """Fit hold + one linear-dB decay to sustain to a chain of (dB/s, target dB) segments.
-
-    Returns (decay seconds per 96 dB, sustain cB, extra hold seconds)."""
-    # Segments that do not move the level (decay 1 to 0 dB) act as holds, handled by the caller
-    segs = [sg for i, sg in enumerate(segs) if abs(sg[1] - (segs[i - 1][1] if i else 0.0)) > 0.01] or segs[-1:]
-    # Build the DLL curve (dB over time) until the last target or -96 dB
-    pts, t, db = [(0.0, 0.0)], 0.0, 0.0
-    for rate, target in segs:
-        target = min(target, 96.0)
-        if rate <= 0: break
-        dt = abs(target - db) / rate
-        t += dt
-        db = target
-        pts.append((t, db))
-    final = pts[-1][1]
-    if final >= 90: final = 100.0  # silence
-    if len(segs) == 1 or abs(segs[0][1] - segs[-1][1]) < 0.5:
-        rate = segs[0][0]
-        return (96.0 / rate if rate > 0 else 100.0), min(final, 100) * 10, 0.0
-    # Two segments: least squares in dB weighted by gain, over the curve until -60 dB (or its end)
-    def dll(tt):
-        for (t0, d0), (t1, d1) in zip(pts, pts[1:]):
-            if tt <= t1: return d0 + (d1 - d0) * (tt - t0) / max(t1 - t0, 1e-9)
-        return pts[-1][1]
-    tend = pts[-1][0]
-    for (t0, d0), (t1, d1) in zip(pts, pts[1:]):
-        if d1 >= 60 and d0 < 60:
-            tend = t0 + (60 - d0) / max(d1 - d0, 1e-9) * (t1 - t0); break
-    import numpy as np
-    lo, hi = min(sg[0] for sg in segs), max(sg[0] for sg in segs)
-    rates = lo * 2 ** (np.arange(-12, int(12 * math.log2(hi / lo)) + 13) / 12) if lo > 0 else np.array([hi])
-
-    def search(tend, sustains):
-        """Best (error, rate, hold, sustain) of clip((t - hold) * rate, 0, sustain) on [0, tend], gain weighted."""
-        ts = np.linspace(0, tend, 201)
-        target = np.interp(ts, [p[0] for p in pts], [p[1] for p in pts])
-        g = 10 ** (-target / 20)
-        holds = np.linspace(0, tend, 41)
-        m = np.clip((ts[None, None, None, :] - holds[None, :, None, None]) * rates[None, None, :, None], 0,
-                    sustains[:, None, None, None])
-        err = (g * (m - target) ** 2).sum(axis=3)
-        si, hi_, ri = np.unravel_index(np.argmin(err), err.shape)
-        return float(err[si, hi_, ri]), float(rates[ri]), float(holds[hi_]), float(sustains[si])
-    _, rate, hold, sus = search(tend, np.array([final]))
-    # A fast decay 1 then a slow decay 2 (FunkGtr2 0/43/28 element 2: -17 dB in 150 ms, then about 3 dB/s) fits
-    # decay 1 to a sustain level much better than one line to silence (that was 11 dB too quiet at the start,
-    # 3 dB loud later). Judged over the first 8 s and only when it halves the error: a steady piano decay
-    # (GrandPno 7..8 dB/s) does not reach its end level in that time, any sustain below that ties, and a held note
-    # would stop decaying there. Over 4 s BritePno's low keys (decay 2 at 2.7 dB/s) took a sustain and held notes
-    # in Storms Over Jupiter ch 7 got worse. Not for elements that ignore note-off (drums), SF2 would hold the
-    # sustain until the note-off.
-    if allow_sustain and tend > DECAY_FIT_SECONDS:
-        t4 = DECAY_FIT_SECONDS
-        ts = np.linspace(0, t4, 201)
-        target = np.interp(ts, [p[0] for p in pts], [p[1] for p in pts])
-        g = 10 ** (-target / 20)
-        e_line = float((g * (np.clip((ts - hold) * rate, 0, final) - target) ** 2).sum())
-        e_sus, r2, h2, s2 = search(t4, np.linspace(1, min(final, 96), 24))
-        if e_sus < 0.5 * e_line and s2 < final - 3: rate, hold, sus = r2, h2, s2
-    return 96.0 / rate, min(sus, 100) * 10, hold
 
 # spessasynth_core modulator curves (unipolar, 0..1)
 VEL_CURVES = {
@@ -395,6 +355,10 @@ def fit_cc74_velocity(vels):
         if abs(v) >= 5: out[side].append(list(curve) + [int(v)] if side == 'vel' else [curve, int(v)])
     return out
 
+def r71(r, v):
+    """Resonance at CC71 v for an element resonance r (0.5 steps per CC value from 64, 31 at most)."""
+    return max(r, (v - 64) // 2) if v > 64 else max(0, r - (64 - v) // 2)
+
 @lru_cache(maxsize=None)
 def brightness_fits(c, r, vels=None):
     """CC74 and CC71 cutoff response at register cutoff c, resonance r.
@@ -410,8 +374,7 @@ def brightness_fits(c, r, vels=None):
     if vels:
         fc = fit_cc74_velocity(vels)
     att = fit_halves(lambda cc: -m74(cc, r, top)[2] * 10, -base[2] * 10, 5)
-    r71 = lambda v: max(r, (v - 64) // 2) if v > 64 else max(0, r - (64 - v) // 2)
-    cc71 = fit_halves(lambda v: filter_match(min(c, 0x7ff if r71(v) >= 4 else 0x7c0), r71(v))[0], base[0], 20)
+    cc71 = fit_halves(lambda v: filter_match(min(c, 0x7ff if r71(r, v) >= 4 else 0x7c0), r71(r, v))[0], base[0], 20)
     # CC74 x CC71: how CC74 maps at the resonance CC71 sets, minus how it maps at the element's own. Fitted over
     # both controllers as CC74 curves with CC71 as the second source, a switch (full from 65 up) plus bipolar
     # linear and convex ones. With the switch alone it played the resonance 31 difference at CC71 85 already
@@ -426,7 +389,7 @@ def brightness_fits(c, r, vels=None):
            'convex': lambda v: math.copysign(_curve('convex', abs(v - 64) / 64), v - 64)}
     rows, ys = [], []
     for v in cc71s:
-        rv = r71(v)
+        rv = r71(r, v)
         tv = 0x7ff if rv >= 4 else 0x7c0
         bv = filter_match(min(c, tv), rv)[0]
         ys.append(np.array([filter_match(max(0, min(tv, c + (cc - 64) * 16)), rv)[0] - bv for cc in range(128)]) - own)
@@ -546,9 +509,9 @@ def element_zones(tid):
         else:
             groups.append({'sample': s, 'keys': [(k, v)]})
     pitch_curve = None
+    # Drums that ignore note-off keep going after it, melodic notes stop at note-off
+    ignores_off = tid.startswith('d:') and '0x500' not in cref['off']
     if ps:
-        # Drums that ignore note-off keep going after it, melodic notes stop at note-off
-        ignores_off = tid.startswith('d:') and '0x500' not in cref['off']
         seq = [(b, v) for b, v in (r['long'] or {}).get('0x680', []) if ignores_off or b < 690]
         cs = np.array([pitch_cents(v) for b, v in seq if b >= 4])
         if len(cs) >= 3:
@@ -569,7 +532,8 @@ def element_zones(tid):
         center key's note-off)."""
         if k not in egs:
             o2 = v['off'] if '0x500' in v['off'] or not tid.startswith('m:') else cref['off']
-            egs[k] = amp_eg(v['on'], o2, decay2=z_d2(v['on'], o2, d2, el, cref), hold_extra=z_hold(d2, cref))
+            egs[k] = amp_eg(v['on'], o2, decay2=z_d2(v['on'], o2, d2, el, cref), decay1_wait=z_hold(d2, cref),
+                            decay2_seen=d2 is not None)
         return egs[k]
 
     def key_values(k, v):
@@ -578,7 +542,8 @@ def element_zones(tid):
         m = filter_match(c, rr)
         e = key_eg(k, v)
         # Times under 4 ms all sound instant, -12000 (none) would swamp the line fit
-        return a - m[2] * 10, m[0], max(-8000, e['decayVolEnv']), max(-8000, e['releaseVolEnv'])
+        decay = e['decay2VolEnv'] if e['decay2VolEnv'] > -12000 else e['decayVolEnv']
+        return a - m[2] * 10, m[0], max(-8000, decay), max(-8000, e['releaseVolEnv'])
 
     def misfit(keys):
         ks = [k for k, _ in keys]
@@ -628,29 +593,29 @@ def element_zones(tid):
             rel = [v for b, v in (r['long'] or {}).get('0x500', []) if b >= 690]
             if rel:
                 off = {**off, '0x500': (rel[0] & 0x80) | max(0, min(0x7f, (rel[0] & 0x7f) + _delta(on, {}, cref)))}
-        eg = amp_eg(on, off, decay2=z_d2(on, off, d2, el, cref), hold_extra=z_hold(d2, cref))
+        eg = amp_eg(on, off, decay2=z_d2(on, off, d2, el, cref), decay1_wait=z_hold(d2, cref), decay2_seen=d2 is not None)
         level_offset = eg.pop('levelOffset')
         # The decay and release rates follow the key (Orgel 0/64/10: decay rate +1 every 3 keys, the time halves
-        # every 24 keys). Slopes in timecents per key from each key's own registers. Keys where the fit changes
-        # shape (sustain, folded click) stay out.
+        # every 24 keys). Slopes in timecents per key from each key's own registers. The core applies the one
+        # slope to both decays, so it comes from decay 2 where there is one (the long part, decay 1 also carries
+        # the center key's wait stretch). Keys where the envelope changes shape (other levels, no decay 2) stay out.
         dk, rk = [], []
+        slope_of = 'decay2VolEnv' if eg['decay2VolEnv'] > -12000 else 'decayVolEnv'
         for k, v in g['keys']:
             e = key_eg(k, v)
-            if abs(e['sustainVolEnv'] - eg['sustainVolEnv']) < 5 and abs(e['levelOffset'] - level_offset) < 5:
-                if e['decayVolEnv'] > -12000: dk.append((k, e['decayVolEnv']))
+            if abs(e['sustainVolEnv'] - eg['sustainVolEnv']) < 5 and abs(e['sustain2VolEnv'] - eg['sustain2VolEnv']) < 5 \
+                    and (e['decay2VolEnv'] > -12000) == (eg['decay2VolEnv'] > -12000) \
+                    and abs(e['levelOffset'] - level_offset) < 5:
+                if e[slope_of] > -12000: dk.append((k, e[slope_of]))
                 if '0x500' in v['off'] or not tid.startswith('m:'): rk.append((k, max(-8000, e['releaseVolEnv'])))
         decay_slope = linfit(*zip(*dk))[0] if len(dk) >= 2 else 0.0
         release_slope = linfit(*zip(*rk))[0] if len(rk) >= 2 else 0.0
-        # Drum notes that ignore note-off but hold before decaying: SF2 would end the hold at note-off, so the
-        # builder bakes the envelope into the sample and the zone plays it to the end
-        tc = lambda v: 0.0 if v <= -12000 else 2 ** (v / 1200)
-        # Only where cutting the hold at note-off would lose more than 1 dB of the decay
-        lost_db = (tc(eg['attackVolEnv']) + tc(eg['holdVolEnv'])) * 96 / max(tc(eg['decayVolEnv']), 1e-3)
-        bake = tid.startswith('d:') and '0x500' not in off and eg['sustainVolEnv'] >= 960 and lost_db > 1
+        # Drum notes without a release write ignore note-off (XG Rcv Note Off): their envelope plays to the end
+        ignore_off = tid.startswith('d:') and '0x500' not in off
         zones.append({'keyLo': ks[0], 'keyHi': ks[-1], 'sample': g['sample'],
                       'scaleTuning': round(scale), 'tuneCents': tune, 'attenuation': att_icpt + att_slope * center[0] + level_offset,
                       'attSlope': att_slope, 'pan': pan, 'filterFc': fc_icpt + fc_slope * center[0], 'fcSlope': fc_slope,
-                      'filterQ': fms[len(fms) // 2][1], 'centerKey': center[0], 'eg': eg, 'bakeEnvelope': bake,
+                      'filterQ': fms[len(fms) // 2][1], 'centerKey': center[0], 'eg': eg, 'ignoreNoteOff': ignore_off,
                       'decaySlope': decay_slope, 'releaseSlope': release_slope,
                       '_c': flt[len(flt) // 2][0], 'bakeRoot': tks[len(tks) // 2]})
     # CC71 (harmonic content): above 64 the resonance rises to 31 at 127, below 64 it falls to 0 (0.5 steps per
@@ -666,13 +631,14 @@ def element_zones(tid):
     # The cutoff over the long note weighted by how loud the note is then (center zone's amp EG): a decaying
     # Clavi 0/0/7 is heard at its start cutoff, a held lead at its sustain
     seq = [(b, v & 0x7ff) for b, v in (r['long'] or {}).get('0x400', []) if b < 690]
+    # Element delay (byte 0x44): the sample and the amplitude EG start this late, the firmware EGs (pitch,
+    # filter) and the LFO depth run from note-on
+    amp_delay = AMP_DELAY_MS[el[0x44]] / 1000 if el and el[0x44] < 16 else 0.0
     eg_delta = 0
     if len(seq) >= 2 and zones:
         ez = min(zones, key=lambda z: abs(z['centerKey'] - TARGETS[tid]['center']))['eg']
-        sec = lambda tc: 0.0 if tc <= -12000 else 2 ** (tc / 1200)
-        t0 = sec(ez['attackVolEnv']) + sec(ez['holdVolEnv'])
         t = np.arange(690) * BLOCK
-        db = -np.minimum(ez['sustainVolEnv'] / 10, 100 * np.maximum(0, t - t0) / max(sec(ez['decayVolEnv']), 1e-3))
+        db = np.where(t < amp_delay, -200.0, vol_env_db(t - amp_delay, ez))
         idx = np.searchsorted([b for b, _ in seq], np.arange(690), side='right') - 1
         cs_t = np.array([seq[max(0, i)][1] for i in idx])
         w = 10 ** (db / 20)
@@ -709,11 +675,6 @@ def element_zones(tid):
         for z in zones: z['brightness'] = brightness_fits(z.pop('_c'), r_ref, z.pop('_v'))
     # Filter EG from the long note, weighted by the loudness of the zone that plays the long note's key.
     # Fitted later in a process pool (filter_eg_job), the zones only get the base offset then.
-    # Pitch that keeps moving a lot (SFX sweeps, random steps): SF2 has no free pitch envelope for it, so the
-    # builder bakes the measured curve into a copy of the sample. Relative to the steady pitch the zones use.
-    if pitch_curve:
-        for z in zones: z['pitchCurve'] = pitch_curve
-        zones = bake_windows(zones, pitch_curve, TARGETS[tid]['center'])
     # Amplitude LFO (reg 0x441 low 5 bits): the DLL attenuates by 0..depth * 1.41 dB along the LFO (a triangle up
     # from 0, or a sawtooth). The bank's mod LFO swings around a center, so the zones take half the depth.
     amp_lfo = (cref['on'].get('0x441', 0) & 0x1f) * AMP_LFO_CB
@@ -722,14 +683,28 @@ def element_zones(tid):
     # unipolar LFO, the zones take half of it like the amplitude LFO
     filter_lfo = (cref['on'].get('0x441', 0) >> 5) * FILTER_LFO_CENTS
     for z in zones: z['filterFc'] -= filter_lfo / 2
-    amp_delay = AMP_DELAY_MS[el[0x44]] / 1000 if el and el[0x44] < 16 else 0.0
-    if amp_delay and amp_delay >= DELAY_PREFIX and zones:
-        zones = delay_windows(zones, amp_delay, TARGETS[tid]['center'])
-    feg_job = None
-    if zones and r['long'] and len(r['long'].get('0x400', [])) >= 2:
-        ref = min(zones, key=lambda z: abs(z['centerKey'] - TARGETS[tid]['center']))
-        feg_job = (r['long']['0x400'], ref['eg'], (VEL_LONG.get(tid) or {}).get('0x400'), vfc_mod, TARGETS[tid]['vel'])
-    return zones, {'ampDelay': amp_delay, 'ampLfo': amp_lfo, 'filterLfo': filter_lfo, 'velRef': vref, 'velocity': vel_mod, 'velocity2': vel_mod2, 'velocityFc': vfc_mod, 'velocityQ': vq_mod, 'filterEG': feg_job, 'cc71': cc71, 'brightness': bright}
+    # LFO waveform (reg 0x480 bit 6: triangle, clear: sawtooth), one LFO drives pitch, filter and amplitude
+    saw = '0x480' in cref['on'] and not cref['on']['0x480'] & 0x40
+    # Cutoff ceiling: the register stops at 0x7c0 below resonance 4, else at 0x7ff (13500 = none, the map's open
+    # filter). CC71 moves the resonance and with it the ceiling.
+    ceiling = lambda rr: filter_match(0x7ff if rr >= 4 else 0x7c0, rr)[0]
+    max_fc = round(min(13500, ceiling(r_ref)))
+    max_fc_cc71 = fit_halves(lambda v: min(13500, ceiling(r71(r_ref, v))), max_fc, 20)
+    feg_job = peg_job = None
+    ref = min(zones, key=lambda z: abs(z['centerKey'] - TARGETS[tid]['center'])) if zones else None
+    if ref and r['long'] and len(r['long'].get('0x400', [])) >= 2:
+        feg_job = (r['long']['0x400'], ref['eg'], (VEL_LONG.get(tid) or {}).get('0x400'), vfc_mod, TARGETS[tid]['vel'],
+                   amp_delay, not ignores_off)
+    # Pitch EG from the long note on the second mod envelope, relative to the steady pitch the zones are tuned to
+    # (pitch_eg_job). Elements with firmware random pitch steps (element byte 0x05 bit 1) keep the bake.
+    if ref and ps and len(ps) >= 2:
+        random_steps = bool(el is not None and el[0x05] & 2)
+        peg_job = ([(b, v) for b, v in r['long']['0x680'] if ignores_off or b < 1035], ref['eg'], amp_delay,
+                   not ignores_off, L_steady, random_steps, pitch_curve)
+    return zones, {'ampDelay': amp_delay, 'ampLfo': amp_lfo, 'filterLfo': filter_lfo, 'saw': saw, 'maxFc': max_fc,
+                   'maxFcCC71': max_fc_cc71, 'velRef': vref, 'velocity': vel_mod, 'velocity2': vel_mod2,
+                   'velocityFc': vfc_mod, 'velocityQ': vq_mod, 'filterEG': feg_job, 'pitchEG': peg_job, 'cc71': cc71,
+                   'brightness': bright}
 
 def velocity_shift_only(seq, seq_vel):
     """True when the velocity 127 long note starts on the cutoff ceiling and velocity only shifts the register.
@@ -801,32 +776,21 @@ AMP_LFO_CB = 14.1
 FILTER_LFO_CENTS = 600
 
 # Element byte 0x44 = 1..15: delay before the element sounds, ms (measured, the same at every key and velocity).
-# The sample and the amplitude EG start after it, the firmware EGs (pitch, filter) run from note-on. The ROM only
-# uses 0..15 (higher values behave differently, 0x7f has no release segment).
+# The sample and the amplitude EG start after it (the bank's delayVoice), the firmware EGs (pitch, filter) run
+# from note-on. The ROM only uses 0..15 (higher values behave differently, 0x7f has no release segment).
 AMP_DELAY_MS = (0, 5.8, 17.4, 37.7, 75.5, 116.1, 156.7, 238.0, 316.4, 435.4, 635.6, 835.9, 1277.1, 1715.4,
                 2597.7, 3477.2)
-DELAY_SLIP = 0.005
-# Shorter delays would only delay the amplitude EG, the sample running from note-on (the first 6 or 17 ms go
-# missing). The prefixed copies of those 41 elements take 4.4 MB, at 0.03 song channels with them got worse
-# (0/66/38 in Cybergate ch 13 dev 3.6 -> 4.3, 2..8 kHz band p90 5.67 -> 6.19).
-DELAY_PREFIX = 0.0
-
-def delay_windows(zones, delay, center):
-    """The bank delays the amplitude EG (delayVolEnv) and starts a silence prefixed copy of the sample, skipping
-    as much of the prefix as the zone's key plays in the delay (src/writer/main.ts). Inside a zone the sample start then
-    slips against the EG at other keys, windows keep that within DELAY_SLIP."""
-    return key_windows(zones, 12 * math.log2(1 + DELAY_SLIP / delay), center, 'delayKey')
 
 def filter_eg_job(job):
     """SF2 modulation envelope generators for one element's filter EG, plus the base cutoff offset."""
     if job is None: return None
-    seq, eg, seq_vel, vfc, lvel = job
+    seq, eg, seq_vel, vfc, lvel, delay, releases = job
     # The note-on fit (17 velocities) sets the start cutoff, the vel 64 long note then only gives the depth. The
     # long note plays at lvel: 127, or the top of the element's velocity range (VeloSlap 0/43/37 element 1: 99)
     rel = lambda curve: vel_x(curve, VEL_LONG_VELOCITY) - vel_x(curve, lvel)
     shift = -vfc[1] * rel(vfc[0]) if vfc else None
     if velocity_shift_only(seq, seq_vel): seq, seq_vel = seq_vel, None
-    f = fit_filter_eg(seq, lambda v: filter_match(*filter_regs({'0x400': v}))[0], eg, seq_vel, shift)
+    f = fit_filter_eg(seq, lambda v: filter_match(*filter_regs({'0x400': v}))[0], eg, seq_vel, shift, delay, releases)
     if not f: return None
     vel = {}
     if 'vel_depth' in f:
@@ -841,16 +805,56 @@ def filter_eg_job(job):
             'releaseModEnv': seconds_to_timecents(f['release']), 'modEnvToFilterFc': round(f['amount']),
             'base': f['base'], 'rms': round(f['rms']), 'span': round(f['span'])}
 
+# Pitch EG on the envelope where it fits within this (cents, loudness weighted RMS) or halves the error of a flat
+# pitch. Elements whose curve was baked before (the SFX sweeps) keep the exact bake unless the envelope is within
+# PEG_BAKE_CENTS.
+PEG_FIT_CENTS = 25
+PEG_BAKE_CENTS = 10
+
+def pitch_eg_job(job):
+    """modEnv2 generators for one element's pitch EG, plus the tuning offset for the zones (cents), or None for a
+    flat pitch. 'bake' when the envelope cannot draw it."""
+    if job is None: return None
+    seq, eg, delay, releases, steady, random_steps, curve = job
+    if random_steps: return {'bake': True}
+    f = fit_filter_eg(seq, pitch_cents, eg, shift=delay, releases=releases, flat=8, ref=steady, core_times=True)
+    if not f or not f['amount']: return {'bake': True} if curve else None
+    good = f['rms'] <= PEG_FIT_CENTS or f['rms'] <= 0.5 * f['rms0']
+    if curve and f['rms'] > PEG_BAKE_CENTS: return {'bake': True}
+    if not good: return None
+    # A pitch EG that settles at the steady pitch (sustain 0) is done long before the long note's note-off, so the
+    # fit cannot see its release (Synth Drum 0/0/118 got 12.5 s). Short song notes end mid-glide, the DLL (like the
+    # bakes before) keeps gliding, at 12.5 s the pitch stayed up and the one-shot sample ran out early (Cybergate
+    # ch 15 dev 1.2 -> 4.5). The release goes on at the decay's rate.
+    if f['sustain'] < 0.05: f['release'] = f['decay']
+    return {'delayModEnv2': seconds_to_timecents(f['delay']), 'attackModEnv2': seconds_to_timecents(f['attack']),
+            'holdModEnv2': seconds_to_timecents(f['hold']), 'decayModEnv2': seconds_to_timecents(f['decay']),
+            'sustainModEnv2': round(1000 * (1 - f['sustain'])), 'releaseModEnv2': seconds_to_timecents(f['release']),
+            'modEnv2ToPitch': round(f['amount']), 'tune': f['y0'] + f['base'] - steady,
+            'rms': round(f['rms'], 1), 'rms0': round(f['rms0'], 1)}
+
 def main():
     instruments = []
     inst_index = {}
     from multiprocessing import Pool
     results = [element_zones(tid) for tid in TARGETS]
-    # At most 8 worker processes (the machine is shared)
-    with Pool(8) as pool:
+    with Pool(JOBS) as pool:
         fegs = pool.map(filter_eg_job, [g['filterEG'] if g else None for _, g in results], chunksize=4)
-    for tid, (zones, glob), feg in zip(TARGETS, results, fegs):
+        pegs = pool.map(pitch_eg_job, [g['pitchEG'] if g else None for _, g in results], chunksize=4)
+    for tid, (zones, glob), feg, peg in zip(TARGETS, results, fegs, pegs):
         if not zones: continue
+        # Pitch: the envelope, or (moving too much for it) the measured curve baked into copies of the sample,
+        # relative to the steady pitch the zones use. A baked curve speeds up and slows down with the key, so
+        # the bakes go in key windows (bake_windows).
+        curve = glob['pitchEG'][-1] if glob['pitchEG'] else None
+        glob['pitchEG'] = None
+        if peg and peg.get('bake') and curve:
+            for z in zones: z['pitchCurve'] = curve
+            zones = bake_windows(zones, curve, TARGETS[tid]['center'])
+        elif peg and not peg.get('bake'):
+            tune = peg.pop('tune')
+            for z in zones: z['tuneCents'] += tune
+            glob['pitchEG'] = peg
         glob['filterEG'] = feg
         if feg:
             for z in zones: z['filterFc'] += feg['base']
@@ -869,7 +873,7 @@ def main():
             alt = BIN[drum_notes(KITS[(int(msb), int(prog))])[int(key)][0] + 3]
             for z in zones: z['exclusiveClass'] = alt
         # Element LFO: vibrato rate, delay and depth plus the CC76/77/78 responses (lfo.py)
-        glob['lfo'] = lfo_for(element_bytes(tid))
+        glob['lfo'] = lfo_for(element_bytes(tid), glob['ampDelay'])
         inst_index[tid] = len(instruments)
         instruments.append({'id': tid, 'zones': zones, 'global': glob})
     presets = []

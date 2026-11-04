@@ -1,7 +1,8 @@
 """Element LFO (vibrato) model from the firmware (FUN_10014900, FUN_100130a0, FUN_10014610, FUN_10014a30) and
 the chip (FUN_1001ab80, FUN_1001a790). All tables are read from the DLL at build time.
 
-lfo_for(el) gives the SF2 values for one element: rate, delay, pitch depth and the CC76/77/78 modulators.
+lfo_for(el) gives the SF2 values for one element: rate, delay, fade, start phase, pitch depth and the CC76/77/78
+modulators.
 """
 import math, os, struct
 import pefile
@@ -79,16 +80,17 @@ def fade_step(target, fade, big):
     return max(1, min(5 if big else 20, s))
 
 
-def effective_delay(byte8, fade, d, cc78=64, cc77=64):
-    """Seconds until the depth reaches half its target (SF2 has no fade-in). The register lags about half of the
-    80 ms rewrite period behind the firmware state, measured median offset -3 blocks without that half."""
+def delay_and_fade(byte8, fade, d, cc78=64, cc77=64):
+    """(delay, fade) seconds: the firmware counts the delay down, then adds the step every tick until the target
+    depth (a linear ramp in depth state units). The register lags about half of the 80 ms rewrite period behind
+    the firmware state, measured median offset -3 blocks without that half."""
     target, big = depth_target(d, cc77)
-    if target <= 0: return 0.0
+    if target <= 0: return 0.0, 0.0
     n = delay_ticks_at(byte8, cc78)
+    if n == 0 and fade == 0: return 0.0, 0.0
     step = fade_step(target, fade, big)
-    up = -(-((target + 1) // 2) // step)
-    if n == 0 and fade == 0: return 0.0
-    return (n + up) * TICK + 0.01
+    up = -(-target // step)
+    return n * TICK + 0.01, up * TICK
 
 
 def _curve(name, v):
@@ -141,8 +143,10 @@ def eval_halves(fit, cc):
     return v
 
 
-def lfo_for(el, direct_drum=False):
-    """SF2 values for one element (el = its 0x4e bytes, None for drum notes that play a wave directly)."""
+def lfo_for(el, amp_delay=0.0):
+    """SF2 values for one element (el = its 0x4e bytes, None for drum notes that play a wave directly).
+    amp_delay: seconds the element starts after note-on (delayVoice). The chip LFO starts with the element, the
+    firmware's delay and fade count from note-on."""
     if el is None:
         # Drum notes without a voice: fixed speed 0x30, no depth (FUN_10014900 drum branch)
         hz = rate_hz(52)
@@ -154,18 +158,22 @@ def lfo_for(el, direct_drum=False):
     hz = rate_hz(SPEED_IDX[speed])
     freq = hz_to_abs_cents(hz)
     depth = depth_cents(DEPTH_REG[min(127, d)]) if d else 0.0
-    delay = effective_delay(el[0x08], fade, d)
-    # SF2 LFO starts at its trough when the delay ends, the chip one at the start of the note (from 0, rising).
-    # A whole number of periods keeps every element in phase with the mod LFO (mod wheel), which has no delay.
-    if delay:
-        delay = round(delay * hz) / hz
-    out = {'freq': round(freq), 'hz': hz, 'depth': round(depth, 1), 'delay': seconds_to_tc(delay), 'delaySeconds': delay}
+    delay, fade_s = delay_and_fade(el[0x08], fade, d)
+    # In voice time: a ramp that began before the element starts begins from 0 at the start (rare)
+    delay -= amp_delay
+    if delay < 0: delay, fade_s = 0.0, max(0.0, fade_s + delay)
+    # The core LFO starts when its delay ends, the chip one runs from the element start (0, rising, like the
+    # core's default phase), so the start phase is where the chip LFO is then
+    phase = round(360 * ((delay * hz) % 1)) % 360
+    out = {'freq': round(freq), 'hz': hz, 'depth': round(depth, 1), 'delay': seconds_to_tc(delay), 'delaySeconds': delay,
+           'fade': seconds_to_tc(fade_s), 'phase': phase}
     # Rates under 0.25 Hz are no vibrato anyway, the floor keeps them from dominating the fit
     out['cc76'] = fit_halves(lambda c: hz_to_abs_cents(max(0.25, rate_hz(SPEED_IDX[speed_at(speed, c)]))), freq, 10)
     if not random_mode:
         out['cc77'] = fit_halves(lambda c: depth_cents(DEPTH_REG[min(127, depth_target(d, c)[0])]), depth)
         base_tc = out['delay']
-        out['cc78'] = fit_halves(lambda c: seconds_to_tc(effective_delay(el[0x08], fade, max(d, 1), c)), base_tc, 30)
+        out['cc78'] = fit_halves(lambda c: seconds_to_tc(max(0.0, delay_and_fade(el[0x08], fade, max(d, 1), c)[0] - amp_delay)),
+                                 base_tc, 30)
     return out
 
 

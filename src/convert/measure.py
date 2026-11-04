@@ -8,6 +8,7 @@ import os, json, struct, concurrent.futures as cf
 from rom import *
 from harness import reglog
 from presets import voice_addr
+from paths import JOBS
 
 XG_ON = [0xf0, 0x43, 0x10, 0x4c, 0x00, 0x00, 0x7e, 0x00, 0xf7]
 
@@ -72,7 +73,7 @@ def doubled(w):
         if seen.setdefault((b, vo, reg), val) != val: return True
     return False
 
-def run_all(jobs, mask=None, per=150, workers=6, name='m'):
+def run_all(jobs, mask=None, per=150, workers=JOBS, name='m'):
     chunks = [jobs[i:i + per] for i in range(0, len(jobs), per)]
     with cf.ThreadPoolExecutor(workers) as ex:
         futs = [ex.submit(run_batch, c, mask, '%s%d' % (name, i)) for i, c in enumerate(chunks)]

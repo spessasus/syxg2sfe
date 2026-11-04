@@ -13,6 +13,8 @@ RESOURCES = os.path.join(DATA, 'resources.json')
 MEASURE = os.path.join(DATA, 'measure.json')
 MEASURE_VEL = os.path.join(DATA, 'measure_vel.json')
 BANK = os.path.join(DATA, 'bank.json')
+# Worker processes for the slow steps (measuring, fitting, Vorbis). Few by default, so the machine stays usable.
+JOBS = max(1, int(os.environ.get('SYXG_JOBS') or 3))
 # The chip filter is the same in every DLL, so its map (filtermap.py) is shared by all builds
 FILTER_MAP = os.path.join(ROOT, 'build', 'filter_map.json')
 

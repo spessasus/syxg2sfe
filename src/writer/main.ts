@@ -29,6 +29,8 @@ interface EnvelopeValues {
     holdVolEnv: number;
     decayVolEnv: number;
     sustainVolEnv: number;
+    decay2VolEnv: number;
+    sustain2VolEnv: number;
     releaseVolEnv: number;
 }
 
@@ -55,7 +57,10 @@ interface BankZone {
      */
     decaySlope: number;
     releaseSlope: number;
-    bakeEnvelope: boolean;
+    /**
+     * Drum note that ignores note-off (XG Rcv Note Off)
+     */
+    ignoreNoteOff: boolean;
     /**
      * CC74 / CC71 cutoff response of this zone, when the element's zones play at different cutoffs
      */
@@ -68,10 +73,6 @@ interface BankZone {
      * Measured pitch curve, [seconds, cents relative to the steady pitch], baked into the sample
      */
     pitchCurve?: [number, number][];
-    /**
-     * Key whose playback rate sets how much of a delayed element's silence prefix the zone skips
-     */
-    delayKey?: number;
 }
 
 type CurveFit = [string, number] | null;
@@ -88,6 +89,19 @@ interface FilterEnvelope {
     releaseModEnv: number;
     modEnvToFilterFc: number;
     velocityDepth?: CurveFit;
+}
+
+/**
+ * The DLL pitch EG fitted to the second modulation envelope (timecents, 0.1% sustain, cents).
+ */
+interface PitchEnvelope {
+    delayModEnv2: number;
+    attackModEnv2: number;
+    holdModEnv2: number;
+    decayModEnv2: number;
+    sustainModEnv2: number;
+    releaseModEnv2: number;
+    modEnv2ToPitch: number;
 }
 
 interface BankInstrument {
@@ -110,6 +124,16 @@ interface BankInstrument {
          * Filter LFO depth, cents from the highest to the lowest cutoff
          */
         filterLfo: number;
+        /**
+         * The element LFO is a sawtooth (else a triangle)
+         */
+        saw: boolean;
+        /**
+         * Cutoff ceiling in absolute cents (13500 = none) and how CC71 moves it
+         */
+        maxFc: number;
+        maxFcCC71: ControllerFit;
+        pitchEG: PitchEnvelope | null;
         velocity: CurveFit;
         velocity2?: CurveFit;
         velocityFc: CurveFit;
@@ -153,6 +177,11 @@ interface ElementLFO {
     freq: number;
     depth?: number;
     delay?: number;
+    fade?: number;
+    /**
+     * Degrees the chip LFO has run when the vibrato LFO starts
+     */
+    phase?: number;
     cc76?: ControllerFit;
     cc77?: ControllerFit;
     cc78?: ControllerFit;
@@ -236,35 +265,9 @@ function decodeSample(s: BankSample) {
 }
 
 /**
- * Renders a zone's volume envelope (attack, hold, decay to silence) into the sample, unrolling the loop.
- * The envelope runs in output time, so it is stretched by the zone's playback rate at its key.
- */
-function bakeEnvelope(s: BankSample, z: BankZone) {
-    const data = decodeSample(s);
-    const seconds = (tc: number) => (tc <= -12_000 ? 0 : 2 ** (tc / 1200));
-    const cents = (z.scaleTuning / 100) * (z.centerKey - s.root) * 100 + z.tuneCents;
-    const rate = 44_100 * 2 ** (cents / 1200);
-    const attack = seconds(z.eg.attackVolEnv) * rate;
-    const holdEnd = attack + seconds(z.eg.holdVolEnv) * rate;
-    const decay = seconds(z.eg.decayVolEnv) * rate;
-    // Stop at -80 dB (the rest is inaudible and only grows the bank), or at the end of a one-shot sample
-    let length = Math.ceil(holdEnd + (decay * 80) / 96);
-    if (s.loop === 0) length = Math.min(length, data.length);
-    const out = new Float32Array(length);
-    for (let i = 0; i < length; i++) {
-        const pos = i < data.length ? i : s.attack + ((i - s.attack) % s.loop);
-        let gain = 1;
-        if (i < attack) gain = i / attack;
-        else if (i > holdEnd) gain = 10 ** ((-96 * (i - holdEnd)) / decay / 20);
-        out[i] = data[pos] * gain;
-    }
-    return out;
-}
-
-/**
  * Renders a zone's sample along its measured pitch curve, in output time at the zone's center key, so the
  * baked sample plays at its own rate there (root key = center key, no tuning). After the curve it keeps the
- * last pitch for one more pass of the ROM loop and loops that. A baked envelope is applied on top.
+ * last pitch for one more pass of the ROM loop and loops that.
  */
 function bakePitch(s: BankSample, z: BankZone) {
     const data = decodeSample(s);
@@ -285,12 +288,7 @@ function bakePitch(s: BankSample, z: BankZone) {
     // A one-shot sample plays on at the last pitch until its data ends (the measured curve stops at 2 s, the
     // DLL does not), the loop below stops there
     const tail = s.loop > 0 ? toLoop + Math.max(1, Math.round(s.loop / lastStep)) : Math.ceil(data.length / lastStep);
-    let length = curveEnd + tail;
-    const seconds = (tc: number) => (tc <= -12_000 ? 0 : 2 ** (tc / 1200));
-    const attack = seconds(z.eg.attackVolEnv) * 44_100;
-    const holdEnd = attack + seconds(z.eg.holdVolEnv) * 44_100;
-    const decay = seconds(z.eg.decayVolEnv) * 44_100;
-    if (z.bakeEnvelope) length = Math.min(length, Math.ceil(holdEnd + (decay * 80) / 96));
+    const length = curveEnd + tail;
     const out = new Float32Array(length);
     let pos = 0;
     let c = 0;
@@ -304,15 +302,10 @@ function bakePitch(s: BankSample, z: BankZone) {
         }
         const p0 = Math.floor(pos);
         const p1 = p0 + 1 < data.length ? p0 + 1 : s.loop > 0 ? s.attack : p0;
-        let v = data[p0] + (data[p1] - data[p0]) * (pos - p0);
-        if (z.bakeEnvelope) {
-            if (i < attack) v *= i / attack;
-            else if (i > holdEnd) v *= 10 ** ((-96 * (i - holdEnd)) / decay / 20);
-        }
-        out[i] = v;
+        out[i] = data[p0] + (data[p1] - data[p0]) * (pos - p0);
         pos += i < curveEnd ? step(curve[c][1]) : lastStep;
     }
-    const looped = s.loop > 0 && !z.bakeEnvelope && i === length;
+    const looped = s.loop > 0 && i === length;
     return { data: out.subarray(0, i), loopStart: looped ? loopStart : 0, loopEnd: looped ? i : 0 };
 }
 
@@ -459,8 +452,6 @@ function cc74Source(kind: CC74Curve) {
 
 const bakedSamples = new Array<BasicSample>();
 const pitchBakes = new Map<string, BasicSample>();
-// Prefixed copies per sample and prefix length (baked sample names repeat across tunings)
-const delayedSamples = new Map<BasicSample, Map<number, BasicSample>>();
 const instruments = bank.instruments.map((inst) => {
     const instrument = new BasicInstrument();
     instrument.name = inst.name;
@@ -505,19 +496,31 @@ const instruments = bank.instruments.map((inst) => {
         g.modulators.push(new Modulator(cc71, lower, GeneratorTypes.initialFilterQ, down[0] - up[0], 0));
     }
     if (down[1]) g.modulators.push(new Modulator(cc71, lower, GeneratorTypes.initialAttenuation, -down[1], 0));
-    // Element LFO. The vibrato LFO carries the element's own depth and delay, the mod LFO (same rate, no delay)
-    // the mod wheel. CC76/77/78 move rate, depth and delay like the firmware does, fitted per half of the
-    // controller as switch gated terms, so 64 leaves the element as it is.
+    // Element LFO. The chip runs one LFO per element for pitch, filter and amplitude, a triangle or a sawtooth that
+    // starts at 0 and rising with the element (like the core's LFOs at their default phase). The vibrato LFO
+    // carries the element's own pitch depth with its delay and fade-in, the mod LFO (same rate, no delay) the mod
+    // wheel and the amplitude and filter LFO. CC76/77/78 move rate, depth and delay like the firmware does,
+    // fitted per half of the controller as switch gated terms, so 64 leaves the element as it is.
     const lfo = inst.global.lfo;
     gen(g, GeneratorTypes.freqVibLFO, lfo.freq);
     gen(g, GeneratorTypes.freqModLFO, lfo.freq);
+    if (inst.global.saw) {
+        gen(g, GeneratorTypes.vibLfoWaveform, 1);
+        gen(g, GeneratorTypes.modLfoWaveform, 1);
+    }
     if (lfo.depth) gen(g, GeneratorTypes.vibLfoToPitch, lfo.depth);
-    // Amplitude LFO: the DLL attenuates from 0 to the depth and back (the zones hold half of it). The mod LFO
-    // starts at 0 rising, so the bank runs a quarter period behind. Sawtooth ones (11 elements) get the triangle.
-    if (inst.global.ampLfo) gen(g, GeneratorTypes.modLfoToVolume, inst.global.ampLfo / 2);
-    // Filter LFO: the cutoff drops by up to the depth along the same LFO (the zones hold half of it)
-    if (inst.global.filterLfo) gen(g, GeneratorTypes.modLfoToFilterFc, inst.global.filterLfo / 2);
     if (lfo.delay !== undefined && lfo.delay > -12_000) gen(g, GeneratorTypes.delayVibLFO, lfo.delay);
+    if (lfo.fade !== undefined && lfo.fade > -12_000) gen(g, GeneratorTypes.fadeVibLFO, lfo.fade);
+    // The core LFO starts at its delay, the chip one with the element: start where the chip LFO is by then
+    if (lfo.phase) gen(g, GeneratorTypes.vibLfoStartPhase, lfo.phase);
+    // Amplitude and filter LFO: the DLL attenuates from 0 up to the depth and back (triangle) or up and resets
+    // (sawtooth), and lowers the cutoff along the same shape. The zones hold half of it and the mod LFO swings
+    // around that. A triangle started at its peak (90 degrees) falls like the DLL's attenuation rises, a sawtooth
+    // started at 180 degrees rises from -1, so its depths turn negative.
+    const { ampLfo, filterLfo, saw } = inst.global;
+    if (ampLfo || filterLfo) gen(g, GeneratorTypes.modLfoStartPhase, saw ? 180 : 90);
+    if (ampLfo) gen(g, GeneratorTypes.modLfoToVolume, ((saw ? -1 : 1) * ampLfo) / 2);
+    if (filterLfo) gen(g, GeneratorTypes.modLfoToFilterFc, ((saw ? -1 : 1) * filterLfo) / 2);
     addControllerResponse(g, 76, lfo.cc76, [GeneratorTypes.freqVibLFO, GeneratorTypes.freqModLFO]);
     addControllerResponse(g, 77, lfo.cc77, [GeneratorTypes.vibLfoToPitch]);
     addControllerResponse(g, 78, lfo.cc78, [GeneratorTypes.delayVibLFO]);
@@ -545,16 +548,29 @@ const instruments = bank.instruments.map((inst) => {
         // The DLL scales the filter EG depth with velocity
         addVelocityModulator(g, feg.velocityDepth, GeneratorTypes.modEnvToFilterFc, -1);
     }
-    // The sample each zone plays (baked copies where needed), first for all zones: a delayed element's prefixed
-    // copies need the longest prefix over the zones sharing a sample
-    const zoneSamples = inst.zones.map((z) => {
+    // Pitch EG on the second modulation envelope, measured on the same long note
+    const peg = inst.global.pitchEG;
+    if (peg) {
+        gen(g, GeneratorTypes.delayModEnv2, peg.delayModEnv2);
+        gen(g, GeneratorTypes.attackModEnv2, peg.attackModEnv2);
+        gen(g, GeneratorTypes.holdModEnv2, peg.holdModEnv2);
+        gen(g, GeneratorTypes.decayModEnv2, peg.decayModEnv2);
+        gen(g, GeneratorTypes.sustainModEnv2, peg.sustainModEnv2);
+        gen(g, GeneratorTypes.releaseModEnv2, peg.releaseModEnv2);
+        gen(g, GeneratorTypes.modEnv2ToPitch, peg.modEnv2ToPitch);
+    }
+    // Cutoff ceiling of the DLL filter at the element's resonance, CC71 moves it with the resonance
+    if (inst.global.maxFc < 13_500) gen(g, GeneratorTypes.maxFilterFc, inst.global.maxFc);
+    addControllerResponse(g, 71, inst.global.maxFcCC71, [GeneratorTypes.maxFilterFc]);
+    // Element delay (byte 0x44): the DLL starts the sample and the amplitude EG this late
+    if (inst.global.ampDelay) gen(g, GeneratorTypes.delayVoice, 1200 * Math.log2(inst.global.ampDelay));
+    inst.zones.forEach((z) => {
         let sample = samples[z.sample];
         let pitchBaked = false;
         if (z.pitchCurve) {
             // Zones of one key window (convert.py bake_windows) share one baked sample, baked at the window's middle
             // key: other keys play it faster or slower, which also stretches the curve in time.
-            const bakeKey = [z.sample, z.scaleTuning, z.tuneCents, z.bakeRoot, JSON.stringify(z.pitchCurve)].join("|") +
-                (z.bakeEnvelope ? JSON.stringify(z.eg) : "");
+            const bakeKey = [z.sample, z.scaleTuning, z.tuneCents, z.bakeRoot, JSON.stringify(z.pitchCurve)].join("|");
             let shared = pitchBakes.get(bakeKey);
             if (!shared) {
                 const s = bank.samples[z.sample];
@@ -575,83 +591,10 @@ const instruments = bank.instruments.map((inst) => {
             }
             sample = shared;
             pitchBaked = true;
-        } else if (z.bakeEnvelope) {
-            const s = bank.samples[z.sample];
-            sample = new BasicSample(
-                `${s.name} k${z.centerKey}`,
-                44_100,
-                s.root,
-                0,
-                SampleTypes.monoSample,
-                0,
-                0
-            );
-            const data = bakeEnvelope(s, z);
-            sample.setAudioData(data, 44_100);
-            sample.loopEnd = data.length;
-            bakedSamples.push(sample);
         }
-        return { sample, pitchBaked };
-    });
-    const prefixes = new Map<BasicSample, number>();
-    const delayFrames = (z: BankZone, sample: BasicSample, pitchBaked: boolean) => {
-        // Sample frames the zone's window key plays in the delay
-        const key = z.delayKey ?? z.centerKey;
-        const cents = (z.scaleTuning / 100) * (key - sample.originalKey) * 100 + (pitchBaked ? 0 : z.tuneCents);
-        return Math.round(inst.global.ampDelay * 44_100 * 2 ** (cents / 1200));
-    };
-    // Delays the converter split into windows (convert.py DELAY_PREFIX) get the prefixed copies
-    const prefixed = inst.zones.some((z) => z.delayKey !== undefined);
-    if (prefixed) {
-        inst.zones.forEach((z, i) => {
-            const { sample, pitchBaked } = zoneSamples[i];
-            prefixes.set(sample, Math.max(prefixes.get(sample) ?? 0, delayFrames(z, sample, pitchBaked)));
-        });
-    }
-    inst.zones.forEach((z, i) => {
-        let { sample } = zoneSamples[i];
-        const { pitchBaked } = zoneSamples[i];
-        // Before the delay copy below, which moves the loop points behind its prefix
         const loops = pitchBaked ? sample.loopEnd > sample.loopStart && sample.loopStart > 0 : bank.samples[z.sample].loop > 0;
-        // The DLL starts the element's sample and amplitude EG after the delay (element byte 0x44). The volume
-        // envelope gets the delay and the zone plays a copy of the sample behind a silence, skipping as much of
-        // it as its window key plays in the delay
-        let startOffset = 0;
-        if (prefixed) {
-            const prefix = prefixes.get(sample)!;
-            const copies = delayedSamples.get(sample) ?? new Map<number, BasicSample>();
-            delayedSamples.set(sample, copies);
-            let copy = copies.get(prefix);
-            if (!copy) {
-                const data = sample.getAudioData();
-                const padded = new Float32Array(prefix + data.length);
-                padded.set(data, prefix);
-                copy = new BasicSample(
-                    `${sample.name} d${Math.round(inst.global.ampDelay * 1000)}`,
-                    44_100,
-                    sample.originalKey,
-                    sample.pitchCorrection,
-                    SampleTypes.monoSample,
-                    sample.loopStart + prefix,
-                    sample.loopEnd + prefix
-                );
-                copy.setAudioData(padded, 44_100);
-                bakedSamples.push(copy);
-                copies.set(prefix, copy);
-            }
-            startOffset = prefix - delayFrames(z, sample, pitchBaked);
-            sample = copy;
-        }
         const zone = instrument.createZone(sample);
         zone.keyRange = { min: z.keyLo, max: z.keyHi };
-        if (inst.global.ampDelay) {
-            gen(zone, GeneratorTypes.delayVolEnv, Math.round(1200 * Math.log2(inst.global.ampDelay)));
-            const coarseOffset = Math.floor(startOffset / 32_768);
-            if (coarseOffset) gen(zone, GeneratorTypes.startAddrsCoarseOffset, coarseOffset);
-            if (startOffset - coarseOffset * 32_768) {
-                gen(zone, GeneratorTypes.startAddrsOffset, startOffset - coarseOffset * 32_768);
-            }
-        }
         // A pitch baked sample already plays at the right pitch at its root key (its key window's middle key, the
         // zones sharing it have the same tuning)
         const tune = pitchBaked ? 0 : z.tuneCents;
@@ -699,20 +642,38 @@ const instruments = bank.instruments.map((inst) => {
             );
         }
         if (z.filterQ > 0) gen(zone, GeneratorTypes.initialFilterQ, z.filterQ);
-        if (z.bakeEnvelope) {
-            // The envelope is in the sample, note-off must not cut it: flat envelope, the longest release
-            gen(zone, GeneratorTypes.releaseVolEnv, 8000);
-            return;
-        }
+        // XG drum notes can ignore note-off, their envelope plays to its end
+        if (z.ignoreNoteOff) gen(zone, GeneratorTypes.ignoreNoteOff, 1);
         gen(zone, GeneratorTypes.attackVolEnv, z.eg.attackVolEnv);
         gen(zone, GeneratorTypes.holdVolEnv, z.eg.holdVolEnv);
-        // The DLL's decay and release rates follow the key. keyNumToVolEnvDecay adds (60 - key) * value to the
-        // decay, the release gets a key number modulator like the level (no SF2 generator for it).
-        const decaySlope = Math.abs(z.decaySlope) >= 1 ? z.decaySlope : 0;
-        const releaseSlope = Math.abs(z.releaseSlope * span) >= 10 ? z.releaseSlope : 0;
+        // The DLL's decay and release rates follow the key. keyNumToVolEnvDecay adds (60 - key) * value to both
+        // decays, the release gets a key number modulator like the level (no SF2 generator for it). The generators
+        // hold the value at key 60 (64 for the release), the core clamps that to the generator range before the key
+        // term is added. A zone of a few keys can sit on a rate breakpoint (Slap Bass 2 0/0/37 keys 85..86: -386
+        // per key, the decay stored at key 60 came to 15588 and played as -2036, 13 dB quiet), so slopes go on
+        // zones of 3 keys or more and only while the stored values stay in range.
+        const inRange = (...values: number[]) => values.every((v) => v >= -12_000 && v <= 8000);
+        const decaySlope =
+            span >= 1 &&
+            Math.abs(z.decaySlope) >= 1 &&
+            inRange(
+                z.eg.decayVolEnv + z.decaySlope * (60 - z.centerKey),
+                z.eg.sustain2VolEnv ? z.eg.decay2VolEnv + z.decaySlope * (60 - z.centerKey) : 0
+            )
+                ? z.decaySlope
+                : 0;
+        const releaseSlope =
+            Math.abs(z.releaseSlope * span) >= 10 && inRange(z.eg.releaseVolEnv - z.releaseSlope * (z.centerKey - 64))
+                ? z.releaseSlope
+                : 0;
         gen(zone, GeneratorTypes.decayVolEnv, z.eg.decayVolEnv + decaySlope * (60 - z.centerKey));
         if (decaySlope) gen(zone, GeneratorTypes.keyNumToVolEnvDecay, -decaySlope);
         gen(zone, GeneratorTypes.sustainVolEnv, z.eg.sustainVolEnv);
+        // XG decay 2: from the decay 1 level (sustainVolEnv) to the decay 2 level at its own rate
+        if (z.eg.sustain2VolEnv) {
+            gen(zone, GeneratorTypes.decay2VolEnv, z.eg.decay2VolEnv + decaySlope * (60 - z.centerKey));
+            gen(zone, GeneratorTypes.sustain2VolEnv, z.eg.sustain2VolEnv);
+        }
         gen(zone, GeneratorTypes.releaseVolEnv, z.eg.releaseVolEnv - releaseSlope * (z.centerKey - 64));
         if (releaseSlope) {
             zone.modulators.push(
@@ -731,9 +692,7 @@ const instruments = bank.instruments.map((inst) => {
     });
     return instrument;
 });
-// A baked sample a delayed element only plays as its prefixed copy is not referenced by any zone
-const used = new Set(instruments.flatMap((i) => i.zones.map((z) => z.sample)));
-soundBank.addSamples(...bakedSamples.filter((s) => used.has(s)));
+soundBank.addSamples(...bakedSamples);
 soundBank.addInstruments(...instruments);
 
 for (const p of bank.presets) {
@@ -802,7 +761,8 @@ const MIN_VORBIS_SECONDS = 0.25;
 const long = soundBank.samples.filter(
     (s) => s.getAudioData().length >= MIN_VORBIS_SECONDS * s.sampleRate
 );
-const WORKERS = 8;
+// ffmpeg processes at once (SYXG_JOBS, see src/convert/paths.py)
+const WORKERS = Math.max(1, Number(process.env.SYXG_JOBS) || 3);
 for (let i = 0; i < long.length; i += WORKERS) {
     const batch = long.slice(i, i + WORKERS);
     const encoded = await Promise.all(

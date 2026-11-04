@@ -3,7 +3,7 @@ by matching magnitude responses on a log frequency grid (50 Hz..16 kHz). Writes 
 filter math (no DLL input), about 20 s at 8 processes."""
 import numpy as np, json, os
 from chip import damping
-from paths import FILTER_MAP
+from paths import FILTER_MAP, JOBS
 FS = 44100.0
 F = np.geomspace(50, 16000, 160)
 Z = np.exp(1j * 2 * np.pi * F / FS)
@@ -56,7 +56,7 @@ def _row(r):
 
 if __name__ == '__main__':
     import concurrent.futures as cf
-    with cf.ProcessPoolExecutor(8) as ex:
+    with cf.ProcessPoolExecutor(JOBS) as ex:
         rows = dict(ex.map(_row, range(32)))
     table = {'%d,%d' % (c, r): v for r, row in rows.items() for c, v in row.items()}
     os.makedirs(os.path.dirname(FILTER_MAP), exist_ok=True)

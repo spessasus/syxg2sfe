@@ -14,8 +14,8 @@ Currently, you can use SFe with:
 
 Note that you need your own copy of the plugin. This repository does not ship it.
 
-`spessasynth_core` will improve sfe with new features 
-to make this port more accurate. (such as modEnv2 for pitch envelope)
+`spessasynth_core` 4.4.5 improved sfe with new features
+to make this port more accurate (such as modEnv2 for pitch envelope).
 
 This is vibecoded.
 Text below is written by AI too. I only wrote this section.
@@ -49,7 +49,11 @@ python3 build.py --dll input/syxg50.dll --output out
 
 This writes `out/syxg50.sf4` and `out/syxg50_vorbis.sf4` (the same bank with longer samples in Ogg Vorbis).
 The first run measures every voice in the plugin under Wine, which takes a while. The results are kept in
-`build/syxg50/`, so later runs only redo the fitting and writing. `--full` starts from scratch.
+`build/syxg50/`, so later runs only redo the fitting and writing. `--full` starts from scratch. The slow steps use
+3 worker processes, set `SYXG_JOBS` to change that (for example `SYXG_JOBS=8 python3 build.py ...`).
+
+The banks use SFE generators that spessasynth_core 4.4.5 added (see Design choices). A player on an older
+version ignores them, so pitch envelopes, second decays, delayed elements and drum notes play wrong there.
 
 Supported plugin files (sha256):
 
@@ -86,27 +90,28 @@ Plain SF2 cannot hold this bank:
   voices sit on MSB 0 / LSB 64 and 42 SFX voices on MSB 64 / LSB 0, and one SF2 bank number cannot tell them
   apart. SFE's bank field carries MSB, LSB and the drum flag, so every XG bank maps 1:1.
 - **Size limits.** SF2 counts zones, generators and modulators with 16-bit indexes (65,536 each). The bank has
-  171,612 generators and 462,733 modulators. SFE extends the indexes.
+  173,063 generators and 457,890 modulators. SFE extends the indexes.
 - **Default modulators.** SF2's default modulators are fixed. The plugin differs (CC74 moves the cutoff half as
   far, the mod wheel vibrato has no delay, channel pressure does nothing), so the bank brings its own list.
+- **Generators SF2 lacks.** An XG voice does more than the SF2 synthesis model, and SFE adds generators for it:
+  - a second modulation envelope, so the pitch envelope gets its own (SF2 has one for both pitch and filter),
+  - a second decay segment, XG envelopes decay to one level, then to another at their own rate,
+  - ignoring note-off, which XG drum notes do (their envelope plays to the end even for very short notes),
+  - a delayed voice start, XG elements can start up to 3.5 s after the note,
+  - LFO fade-in, start phase and a sawtooth waveform,
+  - a cutoff ceiling, the plugin's filter can not open past a point and velocity or the envelope saturate there.
 
-### What neither format can express
+### What SFE still can not express
 
-The SF2 synthesis model (which SFE shares) is simpler than an XG voice, so the bank works around it:
-
-- One modulation envelope, while XG has separate pitch and filter envelopes with several levels and rates. The
-  filter envelope gets it, the pitch envelope is approximated, and long pitch sweeps are baked into sample copies.
-- One decay segment with fixed times, while XG envelopes have two and move at fixed rates (a shallower depth
-  finishes sooner).
-- Modulators add in cents, without a clamp, from two sources. XG adds velocity, CC74, resonance and the filter
-  envelope in its own register units and maps the sum to a frequency with a ceiling. The bank fits controller x
-  velocity terms per zone instead, about 30 modulators per zone.
-- No note-off ignore and no delayed start, both of which XG drum notes and elements use. Drum envelopes and
-  delayed elements are baked into sample copies too.
-- Triangle LFOs with a fixed phase, while XG has one LFO per voice with pitch, filter and amplitude outputs and a
-  sawtooth option.
-
-So a bank from a 4 MB ROM ends up around 64 MB, most of it baked sample copies.
+- Modulators add in cents, from two sources. XG adds velocity, CC74, resonance and the filter envelope in its own
+  register units and maps the sum to a frequency that bends near the top. The bank fits controller x velocity
+  terms per zone instead, about 30 modulators per zone.
+- XG envelopes move at fixed rates, so a shallower depth also finishes sooner. SF2 envelope segments have fixed
+  times.
+- The plugin takes the larger of the element's vibrato and the mod wheel's, SF2 modulators add them.
+- Pitch that moves in random steps or in several sweeps (SFX voices) is more than one envelope can draw. Those
+  elements get their measured pitch curve baked into sample copies, so the bank ends up around 40 MB from a 4 MB
+  ROM.
 
 ## License
 
