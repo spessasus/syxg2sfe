@@ -230,6 +230,55 @@ def fit_cutoff_velocity(points, ref=127):
     fits = sorted(((n, round(a)) for n, a in zip(pick[1], pick[2]) if abs(a) >= 1), key=lambda f: -abs(f[1]))
     return (fits[0] if fits else (pick[1][0], 0)), (fits[1] if len(fits) > 1 else None)
 
+VFC_STEP_MIN, VFC_STEP_MAX_ERR, VFC_STEP_TOL, VFC_STEP_MAX, VFC_STEP_FROM = 250, 1100, 100, 5, 24
+
+def velocity_steps(points, fits):
+    """Velocity ranges with their own cutoff offset where the curves cannot follow the DLL's velocity table.
+    points: (velocity, darkening in cents against velocity 127), fits: [(curve, amount)] the modulators.
+    Rubber Bass 0/66/38 has an elbow at the top (register 1463, 1655, 1703 at velocities 112, 120, 127) and no pair of
+    SF2 curves gets within 600 cents of it. Returns [(lo, hi, offset cents)] covering 1..127, or None when the fit
+    is within VFC_STEP_MIN between velocities 48 and 127. The offsets are the middle of the residual in each range,
+    the ranges come from a search for the smallest worst case with at most VFC_STEP_MAX of them. Soft notes (below
+    VFC_STEP_FROM) do not count and play with the first range."""
+    vs = np.arange(VFC_STEP_FROM, 128)
+    data = np.interp(vs, [v for v, _ in sorted(points)], [y for _, y in sorted(points)])
+    res = np.array([sum(a * vel_x(n, int(v)) for n, a in fits) for v in vs]) - data
+    worst = np.abs(res[48 - VFC_STEP_FROM:]).max()
+    # Only a smooth velocity table with an elbow: the darkening falls with velocity. Voices whose data jumps around
+    # (Finger Slap Bass 0/43/33, residual 5000 cents) got worse with steps.
+    if worst <= VFC_STEP_MIN or worst > VFC_STEP_MAX_ERR or np.diff(data).max() > 30: return None
+    # The top range holds velocity 127 exactly (the generator values are those of velocity 127)
+    def span(i, j):
+        if j == len(vs) - 1: return np.abs(res[i:] - res[-1]).max()
+        return (res[i:j + 1].max() - res[i:j + 1].min()) / 2
+    n = len(vs)
+    best = None
+    for k in range(2, VFC_STEP_MAX + 1):
+        # cost[r][j]: smallest worst half span with r ranges over the first j + 1 velocities
+        cost = [[np.inf] * n for _ in range(k + 1)]
+        cut = [[0] * n for _ in range(k + 1)]
+        for j in range(n): cost[1][j] = span(0, j)
+        for r in range(2, k + 1):
+            for j in range(r - 1, n):
+                for i in range(r - 2, j):
+                    c = max(cost[r - 1][i], span(i + 1, j))
+                    if c < cost[r][j]: cost[r][j], cut[r][j] = c, i
+        best = (cost[k][n - 1], k, cut)
+        if best[0] <= VFC_STEP_TOL: break
+    _, k, cut = best
+    ends, j = [], n - 1
+    for r in range(k, 0, -1):
+        ends.append(j)
+        j = cut[r][j] if r > 1 else -1
+    ends.reverse()
+    out, lo = [], 0
+    for e in ends:
+        seg = res[lo:e + 1]
+        out.append((int(vs[lo]) if lo else 1, int(vs[e]),
+                    round(float(res[-1] if e == n - 1 else (seg.max() + seg.min()) / 2))))
+        lo = e + 1
+    return out
+
 def fit_velocity_offset(points, ref=127):
     """Like fit_velocity, plus an offset (the value at velocity ref): (curve, amount, offset). No convex: it is
     steep near 127, so the offset ran away (E.Grand 0/0/2 to a 35950 cent cutoff, past the 16 bit generator)."""
@@ -431,6 +480,7 @@ def element_zones(tid):
     vels = r['vels']
     vel_mod = vel_mod2 = None
     vfc_mod = vfc_mod2 = None
+    vel_steps = None
     vfc_offset = 0.0
     vq_mod = None
     # The velocity fits are relative to velocity 127, or to the element's top velocity when its range ends lower
@@ -471,6 +521,7 @@ def element_zones(tid):
             vfc_offset = -off
         elif any(abs(y) > 20 for _, y in fpts):
             vfc_mod, vfc_mod2 = fit_cutoff_velocity(fpts, vref)
+            if vref == 127: vel_steps = velocity_steps(fpts, [f for f in (vfc_mod, vfc_mod2) if f])
         if any(abs(y) > 5 for _, y in qpts): vq_mod = fit_velocity(qpts, vref)
     d2 = decay2_regs(tid)
     el = element_bytes(tid)
@@ -726,7 +777,7 @@ def element_zones(tid):
                    not ignores_off, L_steady, random_steps, pitch_curve, vel_seq if len(vel_seq) >= 2 else None, TARGETS[tid]['vel'])
     return zones, {'ampDelay': amp_delay, 'ampLfo': amp_lfo, 'filterLfo': filter_lfo, 'saw': saw, 'maxFc': max_fc,
                    'maxFcCC71': max_fc_cc71, 'velRef': vref, 'velocity': vel_mod, 'velocity2': vel_mod2,
-                   'velocityFc': vfc_mod, 'velocityFc2': vfc_mod2, 'velocityQ': vq_mod, 'filterEG': feg_job, 'pitchEG': peg_job, 'cc71': cc71,
+                   'velocityFc': vfc_mod, 'velocityFc2': vfc_mod2, 'velSteps': vel_steps, 'velocityQ': vq_mod, 'filterEG': feg_job, 'pitchEG': peg_job, 'cc71': cc71,
                    'brightness': bright}
 
 def velocity_shift_only(seq, seq_vel):
@@ -944,6 +995,9 @@ def main():
             z['attenuation'] -= vel_at127(glob['velocity'], glob['velRef']) + vel_at127(glob['velocity2'], glob['velRef'])
             z['filterFc'] += vel_at127(glob['velocityFc'], glob['velRef']) + vel_at127(glob['velocityFc2'], glob['velRef'])
             z['filterQ'] = round(z['filterQ'] + vel_at127(glob['velocityQ'], glob['velRef']))
+        # Velocity ranges with their own cutoff offset (velocity_steps)
+        steps = glob.pop('velSteps')
+        if steps: zones = [dict(z, velLo=lo, velHi=hi, filterFc=z['filterFc'] + off) for z in zones for lo, hi, off in steps]
         if tid.startswith('d:'):
             # Drum note record byte 3: alternate group (closed hi-hat cuts the open one)
             _, msb, prog, key, _ = tid.split(':')

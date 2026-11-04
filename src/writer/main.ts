@@ -37,6 +37,11 @@ interface EnvelopeValues {
 interface BankZone {
     keyLo: number;
     keyHi: number;
+    /**
+     * Velocity range of this zone (the cutoff steps of convert.py velocity_steps), all velocities when left out
+     */
+    velLo?: number;
+    velHi?: number;
     sample: number;
     scaleTuning: number;
     tuneCents: number;
@@ -601,6 +606,7 @@ const instruments = bank.instruments.map((inst) => {
         const loops = pitchBaked ? sample.loopEnd > sample.loopStart && sample.loopStart > 0 : bank.samples[z.sample].loop > 0;
         const zone = instrument.createZone(sample);
         zone.keyRange = { min: z.keyLo, max: z.keyHi };
+        if (z.velLo !== undefined && z.velHi !== undefined) zone.velRange = { min: z.velLo, max: z.velHi };
         // A pitch baked sample already plays at the right pitch at its root key (its key window's middle key, the
         // zones sharing it have the same tuning)
         const tune = pitchBaked ? 0 : z.tuneCents;
