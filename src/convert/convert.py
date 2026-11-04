@@ -3,8 +3,9 @@
 Output: bank.json in the build folder with samples (ROM references), instruments (one per measured element),
 presets and the generator/modulator values. Units are SF2 units (cents, centibels, timecents).
 """
-import json, math, os, sys
+import itertools, json, math, os, sys
 import numpy as np
+from scipy.optimize import nnls
 from collections import defaultdict
 from rom import *
 from paths import MEASURE, MEASURE_VEL, BANK, FILTER_MAP, JOBS, wave_base
@@ -210,6 +211,25 @@ def fit_velocity_pair(points, ref=127):
     if best[0] < 0.7 * rms1 and rms1 - best[0] > 3: return best[1], best[2]
     return one, None
 
+def fit_cutoff_velocity(points, ref=127):
+    """Cutoff over velocity: (curve, amount) and a second one or None. Soft notes (below VFC_SOFT_VEL) pulled the
+    single curve 270 cents off at the middle velocities (median element, 135 of 285 above 300), so they count less.
+    The amounts stay on one side (non-negative least squares): an unconstrained pair fitted the points with
+    opposite amounts of 10000 and more, which was far off between and beyond them (Orchestral Harp 0.9 -> 13.8 dB
+    at velocity 64). A second curve only where it cuts the error by a third."""
+    y = np.array([y for _, y in points], dtype=float)
+    sign = 1 if y.sum() >= 0 else -1
+    w = np.array([VFC_SOFT_WEIGHT if v < VFC_SOFT_VEL else 1.0 for v, _ in points])
+    best = {}
+    for names in [(n,) for n in VEL_CURVES] + list(itertools.combinations(VEL_CURVES, 2)):
+        A = np.stack([[vel_x(n, v) - vel_x(n, ref) for v, _ in points] for n in names], axis=1)
+        c, _ = nnls(A * w[:, None], sign * y * w)
+        err = float(np.sqrt(np.mean(((A @ (c * sign) - y) * w) ** 2)))
+        if len(names) not in best or err < best[len(names)][0]: best[len(names)] = (err, names, c * sign)
+    pick = best[2] if best[2][0] < 0.67 * best[1][0] else best[1]
+    fits = sorted(((n, round(a)) for n, a in zip(pick[1], pick[2]) if abs(a) >= 1), key=lambda f: -abs(f[1]))
+    return (fits[0] if fits else (pick[1][0], 0)), (fits[1] if len(fits) > 1 else None)
+
 def fit_velocity_offset(points, ref=127):
     """Like fit_velocity, plus an offset (the value at velocity ref): (curve, amount, offset). No convex: it is
     steep near 127, so the offset ran away (E.Grand 0/0/2 to a 35950 cent cutoff, past the 16 bit generator)."""
@@ -293,6 +313,7 @@ def z_hold(d2, cref):
     expected = segment_start(on) + level_db(l1) / max(decay_db_per_s(r1), 1e-6)
     return max(0.0, d2[0] * BLOCK - expected)
 
+VFC_SOFT_VEL, VFC_SOFT_WEIGHT = 40, 0.3
 CC74_VEL_CURVES = ('linear', 'convex', 'concave')
 CAP, RIDGE = 3000, 1e-3
 
@@ -409,7 +430,7 @@ def element_zones(tid):
     # Global (per element) velocity response from the center key
     vels = r['vels']
     vel_mod = vel_mod2 = None
-    vfc_mod = None
+    vfc_mod = vfc_mod2 = None
     vfc_offset = 0.0
     vq_mod = None
     # The velocity fits are relative to velocity 127, or to the element's top velocity when its range ends lower
@@ -448,7 +469,8 @@ def element_zones(tid):
             name, amt, off = fit_velocity_offset(free, vref)
             vfc_mod = (name, amt)
             vfc_offset = -off
-        elif any(abs(y) > 20 for _, y in fpts): vfc_mod = fit_velocity(fpts, vref)
+        elif any(abs(y) > 20 for _, y in fpts):
+            vfc_mod, vfc_mod2 = fit_cutoff_velocity(fpts, vref)
         if any(abs(y) > 5 for _, y in qpts): vq_mod = fit_velocity(qpts, vref)
     d2 = decay2_regs(tid)
     el = element_bytes(tid)
@@ -694,7 +716,7 @@ def element_zones(tid):
     ref = min(zones, key=lambda z: abs(z['centerKey'] - TARGETS[tid]['center'])) if zones else None
     if ref and r['long'] and len(r['long'].get('0x400', [])) >= 2:
         feg_job = (r['long']['0x400'], ref['eg'], (VEL_LONG.get(tid) or {}).get('0x400'), vfc_mod, TARGETS[tid]['vel'],
-                   amp_delay, not ignores_off)
+                   amp_delay, not ignores_off, vfc_mod2)
     # Pitch EG from the long note on the second mod envelope, relative to the steady pitch the zones are tuned to
     # (pitch_eg_job). Elements with firmware random pitch steps (element byte 0x05 bit 1) keep the bake.
     if ref and ps and len(ps) >= 2:
@@ -704,7 +726,7 @@ def element_zones(tid):
                    not ignores_off, L_steady, random_steps, pitch_curve, vel_seq if len(vel_seq) >= 2 else None, TARGETS[tid]['vel'])
     return zones, {'ampDelay': amp_delay, 'ampLfo': amp_lfo, 'filterLfo': filter_lfo, 'saw': saw, 'maxFc': max_fc,
                    'maxFcCC71': max_fc_cc71, 'velRef': vref, 'velocity': vel_mod, 'velocity2': vel_mod2,
-                   'velocityFc': vfc_mod, 'velocityQ': vq_mod, 'filterEG': feg_job, 'pitchEG': peg_job, 'cc71': cc71,
+                   'velocityFc': vfc_mod, 'velocityFc2': vfc_mod2, 'velocityQ': vq_mod, 'filterEG': feg_job, 'pitchEG': peg_job, 'cc71': cc71,
                    'brightness': bright}
 
 def velocity_shift_only(seq, seq_vel):
@@ -785,11 +807,11 @@ AMP_DELAY_MS = (0, 5.8, 17.4, 37.7, 75.5, 116.1, 156.7, 238.0, 316.4, 435.4, 635
 def filter_eg_job(job):
     """SF2 modulation envelope generators for one element's filter EG, plus the base cutoff offset."""
     if job is None: return None
-    seq, eg, seq_vel, vfc, lvel, delay, releases = job
+    seq, eg, seq_vel, vfc, lvel, delay, releases, vfc2 = job
     # The note-on fit (17 velocities) sets the start cutoff, the vel 64 long note then only gives the depth. The
     # long note plays at lvel: 127, or the top of the element's velocity range (VeloSlap 0/43/37 element 1: 99)
     rel = lambda curve: vel_x(curve, VEL_LONG_VELOCITY) - vel_x(curve, lvel)
-    shift = -vfc[1] * rel(vfc[0]) if vfc else None
+    shift = -(vfc[1] * rel(vfc[0]) + (vfc2[1] * rel(vfc2[0]) if vfc2 else 0)) if vfc else None
     if velocity_shift_only(seq, seq_vel): seq, seq_vel = seq_vel, None
     f = fit_filter_eg(seq, lambda v: filter_match(*filter_regs({'0x400': v}))[0], eg, seq_vel, shift, delay, releases)
     if not f: return None
@@ -920,7 +942,7 @@ def main():
         # Same for the note-on velocity modulators (attenuation adds, cutoff and resonance subtract)
         for z in zones:
             z['attenuation'] -= vel_at127(glob['velocity'], glob['velRef']) + vel_at127(glob['velocity2'], glob['velRef'])
-            z['filterFc'] += vel_at127(glob['velocityFc'], glob['velRef'])
+            z['filterFc'] += vel_at127(glob['velocityFc'], glob['velRef']) + vel_at127(glob['velocityFc2'], glob['velRef'])
             z['filterQ'] = round(z['filterQ'] + vel_at127(glob['velocityQ'], glob['velRef']))
         if tid.startswith('d:'):
             # Drum note record byte 3: alternate group (closed hi-hat cuts the open one)

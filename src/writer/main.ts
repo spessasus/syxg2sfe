@@ -139,6 +139,7 @@ interface BankInstrument {
         velocity: CurveFit;
         velocity2?: CurveFit;
         velocityFc: CurveFit;
+        velocityFc2?: CurveFit;
         velocityQ: CurveFit;
         filterEG: FilterEnvelope | null;
         cc71: { up: [number, number]; down: [number, number] };
@@ -477,6 +478,7 @@ const instruments = bank.instruments.map((inst) => {
     }
     // Filter cutoff and resonance drop as the velocity falls
     addVelocityModulator(g, inst.global.velocityFc, GeneratorTypes.initialFilterFc, -1);
+    addVelocityModulator(g, inst.global.velocityFc2, GeneratorTypes.initialFilterFc, -1);
     addVelocityModulator(g, inst.global.velocityQ, GeneratorTypes.initialFilterQ, -1);
     // CC71. The upper half uses the default resonant modulator's exact source (bipolar CC71, no secondary), so it
     // overrides it and spessasynth_core adds back half the added Q as gain, keeping the passband level. That
