@@ -1,4 +1,4 @@
-// Minimal VST2 host for the S-YXG50 plugin (32-bit Windows, runs under Wine). Plays MIDI events through the
+// Minimal VST2 host for the S-YXG50 plugin (32-bit Windows, runs natively or under Wine). Plays MIDI events through the
 // plugin and logs every write to the emulated sound chip's registers, which is what the converter measures.
 //
 // Usage: harness.exe <dll> <events.txt> <blocks> <reglog.bin> [<table.bin> <table resource>]

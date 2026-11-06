@@ -1,4 +1,4 @@
-"""Runs the plugin in the VST host (src/host/harness.c, build/harness.exe) under Wine and returns its chip
+"""Runs the plugin in the VST host (src/host/harness.c, build/harness.exe, under Wine on Linux) and returns its chip
 register writes."""
 import os, subprocess
 import numpy as np
@@ -15,7 +15,7 @@ def reglog(events, blocks, tag='r', binpatch=None):
     ev, log = os.path.join(d, tag + '.txt'), os.path.join(d, tag + '.regs')
     with open(ev, 'w') as f:
         for b, data in events: f.write('%d %s\n' % (b, bytes(data).hex()))
-    args = ['wine', EXE, DLL, ev, str(blocks), log]
+    args = ([] if os.name == 'nt' else ['wine']) + [EXE, DLL, ev, str(blocks), log]
     if binpatch is not None:
         bp = os.path.join(d, tag + '.bin')
         with open(bp, 'wb') as f: f.write(binpatch)

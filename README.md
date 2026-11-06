@@ -24,12 +24,12 @@ But i can't take credit for this repo i guess `¯\_(ツ)_/¯`
 
 ## Requirements
 
-Linux only. On Windows, use [WSL 2](https://learn.microsoft.com/windows/wsl/install) (for example Ubuntu) and
-follow the same steps inside it. Please don't ask for a native Windows version, it will not come.
+Works on Linux and on Windows.
 
 - Python 3 with numpy, scipy and pefile
-- Wine with 32-bit support (the plugin is a 32-bit DLL)
-- MinGW-w64 for 32-bit Windows (`i686-w64-mingw32-gcc`), to build the small VST host the plugin runs in
+- Linux: Wine with 32-bit support (the plugin is a 32-bit DLL).
+- Windows: MinGW-w64 for 32-bit Windows (`i686-w64-mingw32-gcc`), to build the small VST host the plugin runs in.
+  MSVC does not work, the host uses GCC inline assembly
 - Node.js 18 or newer and npm
 - ffmpeg with libvorbis
 
@@ -37,6 +37,18 @@ Arch: `pacman -S python-numpy python-scipy python-pefile wine mingw-w64-gcc node
 
 Debian / Ubuntu: `dpkg --add-architecture i386 && apt update`, then
 `apt install python3-numpy python3-scipy python3-pefile wine wine32 gcc-mingw-w64-i686 nodejs npm ffmpeg`
+
+Windows: install [Python 3](https://www.python.org/downloads/), [Node.js](https://nodejs.org/),
+[ffmpeg](https://ffmpeg.org/download.html) (with libvorbis, for example the "full" build from gyan.dev; it must be
+on `PATH`) and [MSYS2](https://www.msys2.org/). Then, in a normal terminal:
+
+```bat
+pip install numpy scipy pefile
+C:\msys64\usr\bin\pacman -S --needed mingw-w64-i686-gcc
+```
+
+`build.py` finds that compiler in `C:\msys64\mingw32\bin` by itself (set `MSYS2_ROOT` if MSYS2 is elsewhere, or put
+`i686-w64-mingw32-gcc` on `PATH`).
 
 ## Usage
 
@@ -47,8 +59,10 @@ cp /path/to/syxg50.dll input/
 python3 build.py --dll input/syxg50.dll --output out
 ```
 
+On Windows use `copy` and `python build.py ...`, and create the output folder first (`mkdir out`).
+
 This writes `out/syxg50.sf4` and `out/syxg50_vorbis.sf4` (the same bank with longer samples in Ogg Vorbis).
-The first run measures every voice in the plugin under Wine, which takes a while. The results are kept in
+The first run measures every voice in the plugin (under Wine on Linux), which takes a while. The results are kept in
 `build/syxg50/`, so later runs only redo the fitting and writing. `--full` starts from scratch. The slow steps use
 3 worker processes, set `SYXG_JOBS` to change that (for example `SYXG_JOBS=8 python3 build.py ...`).
 
