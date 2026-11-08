@@ -145,6 +145,10 @@ interface BankInstrument {
         velocity2?: CurveFit;
         velocityFc: CurveFit;
         velocityFc2?: CurveFit;
+        /**
+         * CC73 (attack) and CC72 (release) response of the element, terms per half of the CC (converter envelope_cc)
+         */
+        envCc?: { cc72?: EnvelopeHalves; cc73?: EnvelopeHalves } | null;
         velocityQ: CurveFit;
         filterEG: FilterEnvelope | null;
         cc71: { up: [number, number]; down: [number, number] };
@@ -161,6 +165,14 @@ type ControllerHalf = ["step" | "linear" | "convex" | "concave", number][];
 interface ControllerFit {
     up: ControllerHalf;
     down: ControllerHalf;
+}
+
+/**
+ * [curve, timecents, bipolar] terms of one half of a CC, switch gated
+ */
+interface EnvelopeHalves {
+    up?: [string, number, number][];
+    down?: [string, number, number][];
 }
 
 /**
@@ -340,6 +352,14 @@ for (const m of soundBank.defaultModulators) {
     if (!src.isCC) continue;
     if (src.index === 74 && m.destination === GeneratorTypes.initialFilterFc) m.transformAmount = 4800;
 }
+// - Envelope time CCs. The DLL has no CC75 (decay) and moves the attack and release EG rates of each voice by its own
+//   amounts, so core's defaults for CC72, CC73 and CC75 go and every instrument carries its own (addEnvelopeCc).
+for (let i = soundBank.defaultModulators.length - 1; i >= 0; i--) {
+    const m = soundBank.defaultModulators[i];
+    const cc = m.primarySource.isCC ? m.primarySource.index : -1;
+    const envelope: GeneratorType[] = [GeneratorTypes.attackVolEnv, GeneratorTypes.releaseVolEnv, GeneratorTypes.decayVolEnv];
+    if ([72, 73, 75].includes(cc) && envelope.includes(m.destination)) soundBank.defaultModulators.splice(i, 1);
+}
 soundBank.customDefaultModulators = true;
 
 const samples = bank.samples.map((s) => {
@@ -417,6 +437,32 @@ function addControllerResponse(
                     curve === "step"
                         ? new Modulator(gate, none, d, amount, 0)
                         : new Modulator(source(cc, CURVES[curve], false, true, true), gate, d, amount, 0)
+                );
+            }
+        }
+    }
+}
+
+/**
+ * The attack (CC73) and release (CC72) time response of one element, one curve per term and half of the
+ * CC. Like addControllerResponse, a switch gate keeps 64 at zero.
+ */
+function addEnvelopeCc(zone: BasicZone, env: { cc72?: EnvelopeHalves; cc73?: EnvelopeHalves }) {
+    for (const [cc, halves, destination] of [
+        [72, env.cc72, GeneratorTypes.releaseVolEnv],
+        [73, env.cc73, GeneratorTypes.attackVolEnv]
+    ] as const) {
+        for (const half of ["up", "down"] as const) {
+            const gate = source(cc, ModulatorCurveTypes.switch, half === "down", true);
+            for (const [curve, amount, bipolar] of halves?.[half] ?? []) {
+                zone.modulators.push(
+                    new Modulator(
+                        source(cc, CURVES[curve], false, true, bipolar === 1),
+                        gate,
+                        destination,
+                        amount,
+                        0
+                    )
                 );
             }
         }
@@ -544,6 +590,7 @@ const instruments = bank.instruments.map((inst) => {
         );
     }
     if (inst.global.brightness) addBrightness(g, inst.global.brightness);
+    if (inst.global.envCc) addEnvelopeCc(g, inst.global.envCc);
     // Filter EG, measured on the long note at the element's center key
     const feg = inst.global.filterEG;
     if (feg) {

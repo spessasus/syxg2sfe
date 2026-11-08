@@ -164,6 +164,79 @@ def amp_eg(on, off, decay2=None, decay1_wait=0.0, decay2_seen=True):
             'sustain2VolEnv': round(max(-1440, min(1440, sustain2 * 10))),
             'releaseVolEnv': seconds_to_timecents(release), 'levelOffset': offset * 10}
 
+# The DLL's CC73 (attack) and CC72 (release) move the EG rate one step per CC step below 64. Above 64 a cap takes
+# over: the rate never exceeds G (attack) or F (release) of the CC value, whatever the voice's own rate is. CC75
+# (decay) does nothing. Measured from the register log (re/VOICE_NOTES.md, work/egrate2.py).
+ATTACK_CAP = [(64, 120), (68, 68), (72, 56), (76, 48), (80, 44), (88, 34), (96, 26), (104, 20), (112, 14), (120, 6), (127, 2)]
+ENV_CC_TERMS = ('linear', 'concave', 'convex')
+
+def _curve_at(name, bipolar, v):
+    """spessasynth_core's curve at CC value v: it reads the 14 bit value (v << 7) / 16384, so unipolar is v / 128 and
+    bipolar an odd function of v / 64 - 1, exactly 0 at 64"""
+    x = v / 128
+    if not bipolar: return VEL_CURVES[name](x)
+    x = 2 * x - 1
+    return x if name == 'linear' else math.copysign(VEL_CURVES[name](abs(x)), x)
+
+def env_cc_terms(delta):
+    """Fits timecents(cc) for cc 0..127 with curves per half of the CC, switch gated (the writer builds them like
+    addControllerResponse). delta: 128 values. Returns {'up': [[curve, amount, bipolar]], 'down': [...]} or None if
+    all small. The switch gates are off at 64 itself (the value is exactly 0.5), so the halves are 0..63 and 65..127."""
+    out = {}
+    cands = [(c, b) for c in ENV_CC_TERMS for b in (1, 0)]
+    for half, vs in (('down', range(0, 64)), ('up', range(65, 128))):
+        vs = list(vs)
+        y = np.array([delta[v] for v in vs], float)
+        if np.abs(y).max() < 80: continue
+        # Near the neutral CC (where the DLL changes nothing) an error costs more
+        w = np.where(np.abs(y) < 80, 3.0, 1.0)
+        basis = {k: np.array([_curve_at(k[0], k[1], v) for v in vs]) for k in cands}
+        best = None
+        for n in (1, 2, 3):
+            for combo in itertools.combinations(cands, n):
+                M = np.stack([basis[k] for k in combo], 1)
+                a = np.linalg.lstsq(M * w[:, None], y * w, rcond=None)[0]
+                if np.abs(a).max() > 30000: continue
+                err = (w * np.abs(M @ a - y)).max() + 120 * n
+                if best is None or err < best[0]: best = (err, combo, a)
+        out[half] = [[k[0], round(float(a)), k[1]] for k, a in zip(best[1], best[2]) if abs(a) >= 20]
+    return out or None
+
+def envelope_cc(on, off, eg, level_offset):
+    """CC73 / CC72 term fits of one element from its own attack and release rates (see ATTACK_CAP)"""
+    a_reg, a_lvl = on.get('0x4c0', 0x7f), on.get('0x4c1', 0)
+    has_attack = bool(a_reg & 0x80)
+    a0 = a_reg & 0x7f if has_attack else 120
+    start = a_lvl if has_attack else 0x7f
+    def cap(v):
+        for (v0, g0), (v1, g1) in zip(ATTACK_CAP, ATTACK_CAP[1:]):
+            if v <= v1: return g0 + (g1 - g0) * (v - v0) / (v1 - v0)
+        return ATTACK_CAP[-1][1]
+    def attack_tc(v):
+        rate = min(116, a0 + (64 - v)) if v < 64 else min(a0, round(cap(v)))
+        if not has_attack and v <= 64: return eg['attackVolEnv']
+        return seconds_to_timecents(attack_time(max(0, rate), start))
+    att = [attack_tc(v) - attack_tc(64) for v in range(128)]
+    rel = [0] * 128
+    if '0x500' in off and off['0x500'] & 0x80:
+        r0 = off['0x500'] & 0x7f
+        silent = level_offset / 10 + eg['sustainVolEnv'] / 10 + eg['sustain2VolEnv'] / 10
+        def release_tc(rate):
+            if rate > 0x5f:
+                t = (0xff000 - min(0xff000, int(silent / OCT_DB * 65536))) / RELEASE_STEP[rate] * BLOCK
+                return seconds_to_timecents(max(0.001, 4.3 * t))
+            return seconds_to_timecents(96.0 / max(decay_db_per_s(rate, True), 1e-6))
+        def rate_at(v):
+            if v < 64: return min(110, r0 + 64 - v)
+            return min(r0, (154 if v <= 76 else 150) - v) if v > 64 else r0
+        rel = [release_tc(rate_at(v)) - release_tc(r0) for v in range(128)]
+    # The generators clamp near -12000, a fit past that is wasted
+    # Past -6000 timecents the note is silent at once, fitting that range only costs accuracy where it matters
+    att = [max(-6000, d) if abs(d) > 1 else 0 for d in att]
+    rel = [max(-6000, min(9000, d)) for d in rel]
+    fits = {'cc73': env_cc_terms(att), 'cc72': env_cc_terms(rel)}
+    return fits if any(fits.values()) else None
+
 # spessasynth_core modulator curves (unipolar, 0..1)
 VEL_CURVES = {
     'concave': lambda x: 0.0 if x <= 0 else (1.0 if x >= 1 else min(1.0, -400 / 960 * math.log10(1 - x))),
@@ -690,7 +763,8 @@ def element_zones(tid):
                       'attSlope': att_slope, 'pan': pan, 'filterFc': fc_icpt + fc_slope * center[0], 'fcSlope': fc_slope,
                       'filterQ': fms[len(fms) // 2][1], 'centerKey': center[0], 'eg': eg, 'ignoreNoteOff': ignore_off,
                       'decaySlope': decay_slope, 'releaseSlope': release_slope,
-                      '_c': flt[len(flt) // 2][0], 'bakeRoot': tks[len(tks) // 2]})
+                      '_c': flt[len(flt) // 2][0], 'bakeRoot': tks[len(tks) // 2],
+                      '_env': envelope_cc(on, off, eg, level_offset) if tid.startswith('m:') else None})
     # CC71 (harmonic content): above 64 the resonance rises to 31 at 127, below 64 it falls to 0 (0.5 steps per
     # CC value). Both halves as linear modulators, plus the gain the biquad needs at the new resonance.
     c_ref, r_ref = filter_regs(cref['on'])
@@ -775,7 +849,9 @@ def element_zones(tid):
         vel_seq = [(b, v) for b, v in (VEL_LONG.get(tid) or {}).get('0x680', []) if ignores_off or b < 1035]
         peg_job = ([(b, v) for b, v in r['long']['0x680'] if ignores_off or b < 1035], ref['eg'], amp_delay,
                    not ignores_off, L_steady, random_steps, pitch_curve, vel_seq if len(vel_seq) >= 2 else None, TARGETS[tid]['vel'])
-    return zones, {'ampDelay': amp_delay, 'ampLfo': amp_lfo, 'filterLfo': filter_lfo, 'saw': saw, 'maxFc': max_fc,
+    env_cc = min(zones, key=lambda z: abs(z['centerKey'] - TARGETS[tid]['center']))['_env'] if zones else None
+    for z in zones: z.pop('_env')
+    return zones, {'envCc': env_cc, 'ampDelay': amp_delay, 'ampLfo': amp_lfo, 'filterLfo': filter_lfo, 'saw': saw, 'maxFc': max_fc,
                    'maxFcCC71': max_fc_cc71, 'velRef': vref, 'velocity': vel_mod, 'velocity2': vel_mod2,
                    'velocityFc': vfc_mod, 'velocityFc2': vfc_mod2, 'velSteps': vel_steps, 'velocityQ': vq_mod, 'filterEG': feg_job, 'pitchEG': peg_job, 'cc71': cc71,
                    'brightness': bright}
