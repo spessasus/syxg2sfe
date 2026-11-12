@@ -351,6 +351,8 @@ for (const m of soundBank.defaultModulators) {
     }
     if (!src.isCC) continue;
     if (src.index === 74 && m.destination === GeneratorTypes.initialFilterFc) m.transformAmount = 4800;
+    // Core's resonance compensator (CC71 to gain), instruments without their own CC71 terms get none
+    if (src.index === 71 && m.destination === GeneratorTypes.gain) m.transformAmount = 0;
 }
 // - Envelope time CCs. The DLL has no CC75 (decay) and moves the attack and release EG rates of each voice by its own
 //   amounts, so core's defaults for CC72, CC73 and CC75 go and every instrument carries its own (addEnvelopeCc).
@@ -542,21 +544,17 @@ const instruments = bank.instruments.map((inst) => {
     addVelocityModulator(g, inst.global.velocityFc2, GeneratorTypes.initialFilterFc, -1);
     addVelocityModulator(g, inst.global.velocityQ, GeneratorTypes.initialFilterQ, -1);
     // CC71. The upper half uses the default resonant modulator's exact source (bipolar CC71, no secondary), so it
-    // overrides it and spessasynth_core adds back half the added Q as gain, keeping the passband level. That
-    // gain is applied after the attenuation clamp, so it can boost. The DLL needs a bit more gain than Q / 2, the
-    // rest goes to attenuation. A second modulator (switch secondary) reshapes the lower half.
+    // overrides it. The level that rises with the resonance goes on the gain generator, which sits after the
+    // attenuation clamp and can boost. It has the identity of core's default compensator (CC71 linear bipolar plus
+    // CC71 switch), so it replaces that one and carries the whole measured gain. A second modulator (switch
+    // secondary) reshapes the lower half.
     const cc71 = source(71, ModulatorCurveTypes.linear, false, true, true);
     const none = source(ModulatorControllerSources.noController, 0);
     const upper = source(71, ModulatorCurveTypes.switch, false, true);
     const lower = source(71, ModulatorCurveTypes.switch, true, true);
     const { up, down } = inst.global.cc71;
     g.modulators.push(new Modulator(cc71, none, GeneratorTypes.initialFilterQ, up[0], 0));
-    const extraGain = up[1] - up[0] / 2;
-    if (Math.round(extraGain)) {
-        g.modulators.push(
-            new Modulator(cc71, upper, GeneratorTypes.initialAttenuation, -Math.round(extraGain), 0)
-        );
-    }
+    g.modulators.push(new Modulator(cc71, upper, GeneratorTypes.gain, Math.round(up[1]), 0));
     if (down[0] !== up[0]) {
         g.modulators.push(new Modulator(cc71, lower, GeneratorTypes.initialFilterQ, down[0] - up[0], 0));
     }
