@@ -715,6 +715,8 @@ const instruments = bank.instruments.map((inst) => {
         // XG drum notes can ignore note-off, their envelope plays to its end
         if (z.ignoreNoteOff) gen(zone, GeneratorTypes.ignoreNoteOff, 1);
         genTime(zone, GeneratorTypes.attackVolEnv, z.eg.attackVolEnv);
+        // The voice only starts at its peak when the delay is exactly zero as well
+        if (z.eg.attackVolEnv <= -12_000) gen(zone, GeneratorTypes.delayVolEnv, INSTANT);
         genTime(zone, GeneratorTypes.holdVolEnv, z.eg.holdVolEnv);
         // The DLL's decay and release rates follow the key. keyNumToVolEnvDecay adds (60 - key) * value to both
         // decays, the release gets a key number modulator like the level (no SF2 generator for it). The generators
