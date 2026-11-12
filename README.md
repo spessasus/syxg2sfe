@@ -66,7 +66,7 @@ The first run measures every voice in the plugin (under Wine on Linux), which ta
 `build/syxg50/`, so later runs only redo the fitting and writing. `--full` starts from scratch. The slow steps use
 3 worker processes, set `SYXG_JOBS` to change that (for example `SYXG_JOBS=8 python3 build.py ...`).
 
-The banks use SFE generators that spessasynth_core 4.4.5 added (see Design choices). A player on an older
+The banks use SFe generators that spessasynth_core 4.4.5 added (see Design choices). A player on an older
 version ignores them, so pitch envelopes, second decays, delayed elements and drum notes play wrong there.
 
 Supported plugin files (sha256):
@@ -81,7 +81,7 @@ It may work, but it is not guaranteed.
 Presets carry the full voice names (Grand Piano), instruments the 8 character names with the element number
 (GrandPno 1).
 
-Banks: XG voices on bank MSB 0 with the variation number as bank LSB (SFE's extended bank field), SFX voices on
+Banks: XG voices on bank MSB 0 with the variation number as bank LSB (SFe's extended bank field), SFX voices on
 MSB 64, drum kits on MSB 127, SFX kits on MSB 126, and GS copies of the kits as GM/GS drum presets (bank 128 in
 SF2). The bank plays about 7 dB below the plugin, so that every voice keeps its level relative to the others.
 
@@ -96,18 +96,18 @@ to SF2 generators and modulators, one instrument per element, zones split where 
 changes. Samples come straight from the wave ROM with the plugin's loop points, no resampling. The result is
 checked against the plugin by rendering the same notes in both.
 
-### Why SFE and not SF2
+### Why SFe and not SF2
 
 Plain SF2 cannot hold this bank:
 
 - **Bank numbers.** An SF2 preset has one bank number. XG addresses voices by bank MSB and LSB: 40 variation
   voices sit on MSB 0 / LSB 64 and 42 SFX voices on MSB 64 / LSB 0, and one SF2 bank number cannot tell them
-  apart. SFE's bank field carries MSB, LSB and the drum flag, so every XG bank maps 1:1.
+  apart. SFe's bank field carries MSB, LSB and the drum flag, so every XG bank maps 1:1.
 - **Size limits.** SF2 counts zones, generators and modulators with 16-bit indexes (65,536 each). The bank has
-  173,063 generators and 457,890 modulators. SFE extends the indexes.
+  173,063 generators and 457,890 modulators. SFe extends the indexes.
 - **Default modulators.** SF2's default modulators are fixed. The plugin differs (CC74 moves the cutoff half as
   far, the mod wheel vibrato has no delay, channel pressure does nothing), so the bank brings its own list.
-- **Generators SF2 lacks.** An XG voice does more than the SF2 synthesis model, and SFE adds generators for it:
+- **Generators SF2 lacks.** An XG voice does more than the SF2 synthesis model, and SFe adds generators for it:
   - a second modulation envelope, so the pitch envelope gets its own (SF2 has one for both pitch and filter),
   - a second decay segment, XG envelopes decay to one level, then to another at their own rate,
   - ignoring note-off, which XG drum notes do (their envelope plays to the end even for very short notes),
@@ -115,7 +115,7 @@ Plain SF2 cannot hold this bank:
   - LFO fade-in, start phase and a sawtooth waveform,
   - a cutoff ceiling, the plugin's filter can not open past a point and velocity or the envelope saturate there.
 
-### What SFE still can not express
+### What SFe still can not express
 
 - Modulators add in cents, from two sources. XG adds velocity, CC74, resonance and the filter envelope in its own
   register units and maps the sum to a frequency that bends near the top. The bank fits controller x velocity

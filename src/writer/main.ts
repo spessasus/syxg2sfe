@@ -389,8 +389,18 @@ const EMU_ATTENUATION_FACTOR = 0.4;
 /**
  * Sets a generator without the spec range validation.
  */
+const INSTANT = -32_768;
+
 function gen(zone: BasicZone, type: GeneratorType, value: number) {
     zone.setGenerator(type, Math.round(value), false);
+}
+
+/**
+ * Writes an envelope time. Times at the old -12000 floor were the bank's way of saying instant, the SFe
+ * generators now have a real zero time at -32768 (the voice starts at the peak in its first block).
+ */
+function genTime(zone: BasicZone, type: GeneratorType, value: number) {
+    gen(zone, type, value <= -12_000 ? INSTANT : value);
 }
 
 /**
@@ -594,9 +604,9 @@ const instruments = bank.instruments.map((inst) => {
     // Filter EG, measured on the long note at the element's center key
     const feg = inst.global.filterEG;
     if (feg) {
-        gen(g, GeneratorTypes.delayModEnv, feg.delayModEnv);
-        gen(g, GeneratorTypes.attackModEnv, feg.attackModEnv);
-        gen(g, GeneratorTypes.holdModEnv, feg.holdModEnv);
+        genTime(g, GeneratorTypes.delayModEnv, feg.delayModEnv);
+        genTime(g, GeneratorTypes.attackModEnv, feg.attackModEnv);
+        genTime(g, GeneratorTypes.holdModEnv, feg.holdModEnv);
         gen(g, GeneratorTypes.decayModEnv, feg.decayModEnv);
         gen(g, GeneratorTypes.sustainModEnv, feg.sustainModEnv);
         gen(g, GeneratorTypes.releaseModEnv, feg.releaseModEnv);
@@ -607,9 +617,9 @@ const instruments = bank.instruments.map((inst) => {
     // Pitch EG on the second modulation envelope, measured on the same long note
     const peg = inst.global.pitchEG;
     if (peg) {
-        gen(g, GeneratorTypes.delayModEnv2, peg.delayModEnv2);
-        gen(g, GeneratorTypes.attackModEnv2, peg.attackModEnv2);
-        gen(g, GeneratorTypes.holdModEnv2, peg.holdModEnv2);
+        genTime(g, GeneratorTypes.delayModEnv2, peg.delayModEnv2);
+        genTime(g, GeneratorTypes.attackModEnv2, peg.attackModEnv2);
+        genTime(g, GeneratorTypes.holdModEnv2, peg.holdModEnv2);
         gen(g, GeneratorTypes.decayModEnv2, peg.decayModEnv2);
         gen(g, GeneratorTypes.sustainModEnv2, peg.sustainModEnv2);
         gen(g, GeneratorTypes.releaseModEnv2, peg.releaseModEnv2);
@@ -704,8 +714,8 @@ const instruments = bank.instruments.map((inst) => {
         if (z.filterQ > 0) gen(zone, GeneratorTypes.initialFilterQ, z.filterQ);
         // XG drum notes can ignore note-off, their envelope plays to its end
         if (z.ignoreNoteOff) gen(zone, GeneratorTypes.ignoreNoteOff, 1);
-        gen(zone, GeneratorTypes.attackVolEnv, z.eg.attackVolEnv);
-        gen(zone, GeneratorTypes.holdVolEnv, z.eg.holdVolEnv);
+        genTime(zone, GeneratorTypes.attackVolEnv, z.eg.attackVolEnv);
+        genTime(zone, GeneratorTypes.holdVolEnv, z.eg.holdVolEnv);
         // The DLL's decay and release rates follow the key. keyNumToVolEnvDecay adds (60 - key) * value to both
         // decays, the release gets a key number modulator like the level (no SF2 generator for it). The generators
         // hold the value at key 60 (64 for the release), the core clamps that to the generator range before the key

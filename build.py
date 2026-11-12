@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the SFE bank of one S-YXG50 DLL.
+"""Build the SFe bank of one S-YXG50 DLL.
 
 python3 build.py [--dll input/syxg50.dll] [--output .] [--full] [--name "S-YXG50"]
 
