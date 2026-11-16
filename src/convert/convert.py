@@ -42,8 +42,10 @@ def sample_for(on):
     if key not in _sample_index:
         rec = _REC_BY_ADDR.get(addr)
         _sample_index[key] = len(samples)
+        # Some ROM waves have root 255. SF2 reads a root above 127 as 60, so the tuning is fitted against 60 too
+        root = rec['root'] if rec and rec['root'] <= 127 else 60
         samples.append({'addr': addr, 'attack': a, 'loop': b, 'bits': 8 if fmt & 0x80 else 16,
-                        'root': rec['root'] if rec else 60, 'name': 'W%06X' % addr + ('' if a == (rec or {}).get('attack', a) else '+%d' % a)})
+                        'root': root, 'name': 'W%06X' % addr + ('' if a == (rec or {}).get('attack', a) else '+%d' % a)})
     return _sample_index[key]
 
 # ---------- conversions ----------
