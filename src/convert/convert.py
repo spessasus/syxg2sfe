@@ -12,7 +12,7 @@ from paths import MEASURE, MEASURE_VEL, BANK, FILTER_MAP, JOBS, wave_base
 from fegfit import fit as fit_filter_eg, vol_env_db
 from presets import melodic, KITS, KIT_NAMES, wave_records
 from chip import *
-from lfo import lfo_for, fit_halves, _curve
+from lfo import lfo_for, fit_halves
 from functools import lru_cache
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -168,42 +168,10 @@ def amp_eg(on, off, decay2=None, decay1_wait=0.0, decay2_seen=True):
 # over: the rate never exceeds G (attack) or F (release) of the CC value, whatever the voice's own rate is. CC75
 # (decay) does nothing. Measured from the register log (re/VOICE_NOTES.md, work/egrate2.py).
 ATTACK_CAP = [(64, 120), (68, 68), (72, 56), (76, 48), (80, 44), (88, 34), (96, 26), (104, 20), (112, 14), (120, 6), (127, 2)]
-ENV_CC_TERMS = ('linear', 'concave', 'convex')
-
-def _curve_at(name, bipolar, v):
-    """spessasynth_core's curve at CC value v: it reads the 14 bit value (v << 7) / 16384, so unipolar is v / 128 and
-    bipolar an odd function of v / 64 - 1, exactly 0 at 64"""
-    x = v / 128
-    if not bipolar: return VEL_CURVES[name](x)
-    x = 2 * x - 1
-    return x if name == 'linear' else math.copysign(VEL_CURVES[name](abs(x)), x)
-
-def env_cc_terms(delta):
-    """Fits timecents(cc) for cc 0..127 with curves per half of the CC, switch gated (the writer builds them like
-    addControllerResponse). delta: 128 values. Returns {'up': [[curve, amount, bipolar]], 'down': [...]} or None if
-    all small. The switch gates are off at 64 itself (the value is exactly 0.5), so the halves are 0..63 and 65..127."""
-    out = {}
-    cands = [(c, b) for c in ENV_CC_TERMS for b in (1, 0)]
-    for half, vs in (('down', range(0, 64)), ('up', range(65, 128))):
-        vs = list(vs)
-        y = np.array([delta[v] for v in vs], float)
-        if np.abs(y).max() < 80: continue
-        # Near the neutral CC (where the DLL changes nothing) an error costs more
-        w = np.where(np.abs(y) < 80, 3.0, 1.0)
-        basis = {k: np.array([_curve_at(k[0], k[1], v) for v in vs]) for k in cands}
-        best = None
-        for n in (1, 2, 3):
-            for combo in itertools.combinations(cands, n):
-                M = np.stack([basis[k] for k in combo], 1)
-                a = np.linalg.lstsq(M * w[:, None], y * w, rcond=None)[0]
-                if np.abs(a).max() > 30000: continue
-                err = (w * np.abs(M @ a - y)).max() + 120 * n
-                if best is None or err < best[0]: best = (err, combo, a)
-        out[half] = [[k[0], round(float(a)), k[1]] for k, a in zip(best[1], best[2]) if abs(a) >= 20]
-    return out or None
+ENV_CC_MIN = 80
 
 def envelope_cc(on, off, eg, level_offset):
-    """CC73 / CC72 term fits of one element from its own attack and release rates (see ATTACK_CAP)"""
+    """CC73 / CC72 timecents response of one element from its own attack and release rates (see ATTACK_CAP)"""
     a_reg, a_lvl = on.get('0x4c0', 0x7f), on.get('0x4c1', 0)
     has_attack = bool(a_reg & 0x80)
     a0 = a_reg & 0x7f if has_attack else 120
@@ -230,12 +198,14 @@ def envelope_cc(on, off, eg, level_offset):
             if v < 64: return min(110, r0 + 64 - v)
             return min(r0, (154 if v <= 76 else 150) - v) if v > 64 else r0
         rel = [release_tc(rate_at(v)) - release_tc(r0) for v in range(128)]
-    # The generators clamp near -12000, a fit past that is wasted
-    # Past -6000 timecents the note is silent at once, fitting that range only costs accuracy where it matters
+    # The generators clamp near -12000, and past -6000 timecents the note is silent at once. Bounding the response
+    # there keeps the curve's range for the part that is heard
     att = [max(-6000, d) if abs(d) > 1 else 0 for d in att]
     rel = [max(-6000, min(9000, d)) for d in rel]
-    fits = {'cc73': env_cc_terms(att), 'cc72': env_cc_terms(rel)}
-    return fits if any(fits.values()) else None
+    # The whole response as 128 values for the writer's shared custom curves, left out when it stays under
+    # ENV_CC_MIN timecents
+    out = {k: [round(d) for d in y] if max(map(abs, y)) >= ENV_CC_MIN else None for k, y in (('cc73', att), ('cc72', rel))}
+    return out if any(out.values()) else None
 
 # spessasynth_core modulator curves (unipolar, 0..1)
 VEL_CURVES = {
@@ -436,113 +406,60 @@ def z_hold(d2, cref):
     return max(0.0, d2[0] * BLOCK - expected)
 
 VFC_SOFT_VEL, VFC_SOFT_WEIGHT = 40, 0.3
-CC74_VEL_CURVES = ('linear', 'convex', 'concave')
-CAP, RIDGE = 3000, 1e-3
-
-def fit_cc74_velocity(vels):
-    """CC74 cutoff response over velocity. vels: ((velocity, c, r), ..) register cutoff and resonance per velocity.
-    The DLL adds CC74 (16 units per step) and velocity in register units and clamps at the ceiling, the map to cents
-    is steeper near the top. So a soft note gets much more out of CC74 than a loud one (GrandPno key 60 with CC74 95
-    and CC71 85: +3136 cents at velocity 42, +980 at 100). One curve per half, fitted at one velocity, played the
-    soft notes 15..40 dB too dark above 4 kHz. Fitted here over CC74 x velocity: the gated curves per half plus odd
-    CC74 curves with 1 - velocity / 128 as the second source (no gate, a modulator has two sources)."""
-    ccs = np.arange(128)
-    x = (ccs - 64) / 64
-    odd = {'linear': x}
-    for name in ('convex', 'concave'):
-        odd[name] = np.array([math.copysign(_curve(name, abs(v)), v) for v in x])
-    up, down = (x > 0).astype(float), (x < 0).astype(float)
-    rows, ys, bases, ws = [], [], [], []
-    # Small offsets from 64 are the common case, they count more (as in fit_halves)
-    wcc = 1 + 3 * np.exp(-np.abs(ccs - 64) / 8)
-    for vel, c, r in vels:
-        top = 0x7ff if r >= 4 else 0x7c0
-        c = min(c, top)
-        b = filter_match(c, r)[0]
-        ys.append([filter_match(max(0, min(top, c + (cc - 64) * 16)), r)[0] - b for cc in ccs])
-        bases.append(np.full(128, b))
-        u = 1 - vel / 128
-        cols = [up, up * odd['linear'], up * odd['convex'], up * odd['concave'],
-                down, down * odd['linear'], down * odd['convex'], down * odd['concave']]
-        for vc in CC74_VEL_CURVES:
-            uc = _curve(vc, u)
-            cols += [uc * up, uc * down, uc * odd['linear'], uc * odd['convex'], uc * odd['concave']]
-        rows.append(np.stack(cols, axis=1))
-        ws.append(wcc)
-    A, y, base, w0 = np.concatenate(rows), np.concatenate(ys), np.concatenate(bases), np.concatenate(ws)
-    names = [('up', 'step'), ('up', 'linear'), ('up', 'convex'), ('up', 'concave'),
-             ('down', 'step'), ('down', 'linear'), ('down', 'convex'), ('down', 'concave'),
-             ] + [('vel', (p, vc)) for vc in CC74_VEL_CURVES for p in ('stepUp', 'stepDown', 'linear', 'convex', 'concave')]
-    # The synth clamps the cutoff at 13500 like the map's open filter, so a target at 13500 only needs the sum to
-    # get there (dropped once the fit is above it). Above 12000 cents (10 kHz) an error is hard to hear, those
-    # points count less. A little ridge: convex, concave and linear are close, unregularised they cancel in big
-    # amounts.
-    # Overshooting an open target is free up to 600 cents only: CC71 brings the ceiling down (GrandPno at resonance
-    # 31 plays 11870 at CC74 127), and the CC71 term cannot pull back a curve that went 9800 cents over.
-    pred = np.zeros_like(y)
-    is_open = base + y >= 13490
-    for _ in range(12):
-        hi = np.minimum(base + y, base + pred)
-        w = w0 * np.clip((13000 - hi) / 1000, 0.15, 1)
-        t = y.copy()
-        over = is_open & (pred > y + CAP)
-        t[over] = y[over] + CAP
-        w[over] = w0[over] * 0.5
-        w[is_open & (pred >= y) & ~over] = 0
-        Aw = A * w[:, None]
-        lam = RIDGE * (w ** 2).sum() / len(names)
-        coef = np.linalg.solve(Aw.T @ Aw + lam * np.eye(len(names)), Aw.T @ (t * w))
-        pred = A @ coef
-    out = {'up': [], 'down': [], 'vel': []}
-    for (side, curve), v in zip(names, np.round(coef)):
-        if abs(v) >= 5: out[side].append(list(curve) + [int(v)] if side == 'vel' else [curve, int(v)])
-    return out
 
 def r71(r, v):
     """Resonance at CC71 v for an element resonance r (0.5 steps per CC value from 64, 31 at most)."""
     return max(r, (v - 64) // 2) if v > 64 else max(0, r - (64 - v) // 2)
 
+RAW_MIN = 20  # cents, smaller responses are left out
+
+def _mode(g, h, s):
+    """A rank 1 term of a grid as [amount, g, h] with g and h at unit peak (None when it is below RAW_MIN)"""
+    gm, hm = np.abs(g).max(), np.abs(h).max()
+    amount = s * gm * hm
+    if amount < RAW_MIN: return None
+    return [round(float(amount)), [round(float(v), 4) for v in g / gm], [round(float(v), 4) for v in h / hm]]
+
 @lru_cache(maxsize=None)
-def brightness_fits(c, r, vels=None):
-    """CC74 and CC71 cutoff response at register cutoff c, resonance r.
-    CC74 moves c 16 units per step, clamped at 0x7ff (0x7c0 below resonance 4). In SF2 cents that is not a
-    line (ceiling a few steps away, the map bends at the bottom), so it is fitted as curves per half, over
-    velocity when vels (velocity, c, r) is given (fit_cc74_velocity), else at c.
-    CC71 sets the resonance, and the same c plays lower at a higher one, so it gets a cutoff fit too. CC74 maps
-    differently at the resonance CC71 sets: that goes on CC74 curves with CC71 as the second source."""
-    base = filter_match(c, r)
+def brightness_raw(c, r, vels=None):
+    """The CC74 and CC71 cutoff response of one zone as separable terms for the writer's shared custom curves
+    (cutoff cents, the DLL's register map capped at 13500, 0 at the neutral controller value):
+    fc: CC74 x velocity as the two strongest SVD terms [amount, cc74 shape (128), velocity shape (128)],
+    cc71: [amount, CC71 shape] (the cutoff at the element's own register c), x71: CC74 x CC71 as one term
+    (how CC74 maps at the resonance CC71 sets minus the element's own), att: [amount, CC74 shape] (the gain the
+    filter needs)."""
+    cl = lambda v: np.minimum(v, 13500)
+    vels = vels or ((127, c, r),)
     top = 0x7ff if r >= 4 else 0x7c0
+    rows = []
+    for vel, cv, rv in vels:
+        t = 0x7ff if rv >= 4 else 0x7c0
+        cv = min(cv, t)
+        b = filter_match(cv, rv)[0]
+        rows.append([cl(filter_match(max(0, min(t, cv + (cc - 64) * 16)), rv)[0]) - cl(b) for cc in range(128)])
+    rows = np.array(rows)
+    vs = [v for v, _, _ in vels]
+    Y = np.array([[np.interp(v, vs, rows[:, cc]) for cc in range(128)] for v in range(128)])
+    U, S, Vt = np.linalg.svd(Y, full_matrices=False)
+    fc = [m for m in (_mode(Vt[k], U[:, k], S[k]) for k in range(2)) if m]
+    base = filter_match(c, r)[0]
+    y71 = np.array([cl(filter_match(min(c, 0x7ff if r71(r, v) >= 4 else 0x7c0), r71(r, v))[0]) - cl(base) for v in range(128)])
+    cc71 = None
+    if np.abs(y71).max() >= RAW_MIN:
+        cc71 = [round(float(np.abs(y71).max())), [round(float(v), 4) for v in y71 / np.abs(y71).max()]]
     m74 = lambda cc, rr, t: filter_match(max(0, min(t, c + (cc - 64) * 16)), rr)
-    fc = fit_halves(lambda cc: m74(cc, r, top)[0], base[0], 20)
-    if vels:
-        fc = fit_cc74_velocity(vels)
-    att = fit_halves(lambda cc: -m74(cc, r, top)[2] * 10, -base[2] * 10, 5)
-    cc71 = fit_halves(lambda v: filter_match(min(c, 0x7ff if r71(r, v) >= 4 else 0x7c0), r71(r, v))[0], base[0], 20)
-    # CC74 x CC71: how CC74 maps at the resonance CC71 sets, minus how it maps at the element's own. Fitted over
-    # both controllers as CC74 curves with CC71 as the second source, a switch (full from 65 up) plus bipolar
-    # linear and convex ones. With the switch alone it played the resonance 31 difference at CC71 85 already
-    # (GrandPno 1200 cents darker at velocity 42, the DLL at resonance 10 about 650).
-    x = (np.arange(128) - 64) / 64
-    prim = {'stepUp': (x > 0).astype(float), 'stepDown': (x < 0).astype(float), 'linear': x}
-    for name in ('convex', 'concave'):
-        prim[name] = np.array([math.copysign(_curve(name, abs(v)), v) for v in x])
-    own = np.array([m74(cc, r, top)[0] - base[0] for cc in range(128)])
-    cc71s = list(range(0, 128, 4)) + [127]
-    sec = {'switch': lambda v: float(v > 64), 'linear': lambda v: (v - 64) / 64,
-           'convex': lambda v: math.copysign(_curve('convex', abs(v - 64) / 64), v - 64)}
-    rows, ys = [], []
-    for v in cc71s:
-        rv = r71(r, v)
+    own = np.array([cl(m74(cc, r, top)[0]) - cl(base) for cc in range(128)])
+    # CC71 lands on few distinct resonances, so each row is worked out once per resonance
+    rows71 = {}
+    for rv in {r71(r, v) for v in range(128)}:
         tv = 0x7ff if rv >= 4 else 0x7c0
         bv = filter_match(min(c, tv), rv)[0]
-        ys.append(np.array([filter_match(max(0, min(tv, c + (cc - 64) * 16)), rv)[0] - bv for cc in range(128)]) - own)
-        rows.append(np.stack([prim[p] * sec[q](v) for q in sec for p in prim], axis=1))
-    A, y = np.concatenate(rows), np.concatenate(ys)
-    names = [(p, q) for q in sec for p in prim]
-    lam = 1e-3 * len(y) / len(names)
-    coef = np.round(np.linalg.solve(A.T @ A + lam * np.eye(len(names)), A.T @ y))
-    cross71 = [[p, q, int(v)] for (p, q), v in zip(names, coef) if abs(v) >= 10] if np.abs(y).max() >= 20 else []
-    return {'fc': fc, 'att': att, 'cross71': cross71, 'cc71': cc71}
+        rows71[rv] = np.array([cl(m74(cc, rv, tv)[0]) - cl(bv) for cc in range(128)]) - own
+    U, S, Vt = np.linalg.svd(np.array([rows71[r71(r, v)] for v in range(128)]), full_matrices=False)
+    x71 = _mode(Vt[0], U[:, 0], S[0])
+    att = np.array([-m74(cc, r, top)[2] * 10 + filter_match(c, r)[2] * 10 for cc in range(128)])
+    att = [round(float(np.abs(att).max())), [round(float(v), 4) for v in att / np.abs(att).max()]] if np.abs(att).max() >= 10 else None
+    return {'fc': fc, 'cc71': cc71, 'x71': x71, 'att': att}
 
 def element_zones(tid):
     """Zones (dicts) for one element: contiguous keys sharing the sample."""
@@ -800,7 +717,7 @@ def element_zones(tid):
     vel_shift = 0
     if seq and v64:
         vel_shift = round((min(v64[0][1], top) - min(seq[0][1], top)) * (127 - 100) / (127 - VEL_LONG_VELOCITY))
-    # The CC74 curves are fitted over velocity (fit_cc74_velocity), from the velocity sweep at the center key
+    # The CC74 curves cover velocity too (brightness_raw), from the velocity sweep at the center key
     # (24..127) moved to each zone's own cutoff
     sweep = sorted((int(v), filter_regs({**d['on'], **{k: x for k, x in d.get('first', {}).items() if k == '0x400'}}))
                    for v, d in (r.get('vels') or {}).items() if int(v) >= 24 and d.get('on'))
@@ -816,10 +733,10 @@ def element_zones(tid):
     bright = None
     if cs and max(cs) - min(cs) < 16:
         mid = min(zones, key=lambda z: abs(z['_c'] - int(np.median(cs))))
-        bright = brightness_fits(int(np.median(cs)) // 16 * 16, r_ref, mid['_v'])
+        bright = brightness_raw(int(np.median(cs)) // 16 * 16, r_ref, mid['_v'])
         for z in zones: z.pop('_c'), z.pop('_v')
     else:
-        for z in zones: z['brightness'] = brightness_fits(z.pop('_c'), r_ref, z.pop('_v'))
+        for z in zones: z['brightness'] = brightness_raw(z.pop('_c'), r_ref, z.pop('_v'))
     # Filter EG from the long note, weighted by the loudness of the zone that plays the long note's key.
     # Fitted later in a process pool (filter_eg_job), the zones only get the base offset then.
     # Amplitude LFO (reg 0x441 low 5 bits): the DLL attenuates by 0..depth * 1.41 dB along the LFO (a triangle up

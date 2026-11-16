@@ -6,6 +6,7 @@ import {
     BasicPreset,
     BasicSample,
     BasicSoundBank,
+    CustomCurve,
     GeneratorTypes,
     Modulator,
     ModulatorControllerSources,
@@ -146,9 +147,10 @@ interface BankInstrument {
         velocityFc: CurveFit;
         velocityFc2?: CurveFit;
         /**
-         * CC73 (attack) and CC72 (release) response of the element, terms per half of the CC (converter envelope_cc)
+         * CC73 (attack) and CC72 (release) timecents response of the element at every CC value (converter
+         * envelope_cc)
          */
-        envCc?: { cc72?: EnvelopeHalves; cc73?: EnvelopeHalves } | null;
+        envCc?: EnvelopeResponse | null;
         velocityQ: CurveFit;
         filterEG: FilterEnvelope | null;
         cc71: { up: [number, number]; down: [number, number] };
@@ -167,28 +169,38 @@ interface ControllerFit {
     down: ControllerHalf;
 }
 
-/**
- * [curve, timecents, bipolar] terms of one half of a CC, switch gated
- */
-interface EnvelopeHalves {
-    up?: [string, number, number][];
-    down?: [string, number, number][];
+interface EnvelopeResponse {
+    cc72: number[] | null;
+    cc73: number[] | null;
 }
 
 /**
- * CC74 and CC71 cutoff response at one cutoff (src/convert/convert.py brightness_fits)
+ * [amount, shape of the controller, shape of the second controller] with both shapes at unit peak
+ */
+type SeparableTerm = [number, number[], number[]];
+
+/**
+ * CC74 and CC71 cutoff response of one zone (src/convert/convert.py brightness_raw), shapes sampled at every
+ * controller value
  */
 interface Brightness {
     /**
-     * CC74 cutoff curves per half, plus CC74 curves times a curve of 1 - velocity / 128 (vel)
+     * CC74 x velocity cutoff terms
      */
-    fc: ControllerFit & { vel?: [CC74Curve, "linear" | "convex" | "concave", number][] };
-    att: ControllerFit;
-    cc71: ControllerFit;
-    cross71: [CC74Curve, "switch" | "linear" | "convex", number][];
+    fc: SeparableTerm[];
+    /**
+     * [amount, CC71 shape] of the cutoff
+     */
+    cc71: [number, number[]] | null;
+    /**
+     * How CC74 maps at the resonance CC71 sets (CC74 shape, CC71 shape)
+     */
+    x71: SeparableTerm | null;
+    /**
+     * [amount, CC74 shape] of the attenuation
+     */
+    att: [number, number[]] | null;
 }
-
-type CC74Curve = "stepUp" | "stepDown" | "linear" | "convex" | "concave";
 
 /**
  * The element LFO (src/convert/lfo.py). Frequency in absolute cents, delay in timecents, depth in cents.
@@ -245,7 +257,15 @@ const CURVES: Record<string, ModulatorCurveType> = {
 };
 
 /**
- * Creates a modulator source, the declaration file hides the constructor arguments.
+ * Adds modulators to a zone as copies, so the source objects of one can be shared by several (a modulator and its
+ * sources belong to one zone only)
+ */
+function add(zone: BasicZone, ...modulators: Modulator[]) {
+    zone.addModulators(...modulators.map((m) => Modulator.copyFrom(m)));
+}
+
+/**
+ * Creates a modulator source with a built in curve type
  */
 function source(
     index: number,
@@ -356,13 +376,10 @@ for (const m of soundBank.defaultModulators) {
 }
 // - Envelope time CCs. The DLL has no CC75 (decay) and moves the attack and release EG rates of each voice by its own
 //   amounts, so core's defaults for CC72, CC73 and CC75 go and every instrument carries its own (addEnvelopeCc).
-for (let i = soundBank.defaultModulators.length - 1; i >= 0; i--) {
-    const m = soundBank.defaultModulators[i];
-    const cc = m.primarySource.isCC ? m.primarySource.index : -1;
-    const envelope: GeneratorType[] = [GeneratorTypes.attackVolEnv, GeneratorTypes.releaseVolEnv, GeneratorTypes.decayVolEnv];
-    if ([72, 73, 75].includes(cc) && envelope.includes(m.destination)) soundBank.defaultModulators.splice(i, 1);
-}
-soundBank.customDefaultModulators = true;
+const envelopeDestinations: GeneratorType[] = [GeneratorTypes.attackVolEnv, GeneratorTypes.releaseVolEnv, GeneratorTypes.decayVolEnv];
+soundBank.defaultModulators = soundBank.defaultModulators.filter(
+    (m) => !([72, 73, 75].includes(m.primarySource.isCC ? m.primarySource.index : -1) && envelopeDestinations.includes(m.destination))
+);
 
 const samples = bank.samples.map((s) => {
     const loopStart = s.attack;
@@ -415,7 +432,7 @@ function addVelocityModulator(
     sign: number
 ) {
     if (!fit) return;
-    zone.modulators.push(
+    add(zone,
         new Modulator(
             source(ModulatorControllerSources.noteOnVelocity, CURVES[fit[0]], true),
             source(ModulatorControllerSources.noController, 0),
@@ -445,7 +462,7 @@ function addControllerResponse(
         const gate = source(cc, ModulatorCurveTypes.switch, half === "down", true);
         for (const [curve, amount] of terms) {
             for (const d of destinations) {
-                zone.modulators.push(
+                add(zone,
                     curve === "step"
                         ? new Modulator(gate, none, d, amount, 0)
                         : new Modulator(source(cc, CURVES[curve], false, true, true), gate, d, amount, 0)
@@ -456,68 +473,240 @@ function addControllerResponse(
 }
 
 /**
- * The attack (CC73) and release (CC72) time response of one element, one curve per term and half of the
- * CC. Like addControllerResponse, a switch gate keeps 64 at zero.
+ * Largest error in timecents a shared envelope curve may add to the DLL's response (src/convert/convert.py envelope_cc).
+ * Where the DLL moves the time less than ENV_SMALL_TC (small CC moves around 64) a third of it is allowed, those
+ * settings are the common ones.
  */
-function addEnvelopeCc(zone: BasicZone, env: { cc72?: EnvelopeHalves; cc73?: EnvelopeHalves }) {
-    for (const [cc, halves, destination] of [
-        [72, env.cc72, GeneratorTypes.releaseVolEnv],
-        [73, env.cc73, GeneratorTypes.attackVolEnv]
-    ] as const) {
-        for (const half of ["up", "down"] as const) {
-            const gate = source(cc, ModulatorCurveTypes.switch, half === "down", true);
-            for (const [curve, amount, bipolar] of halves?.[half] ?? []) {
-                zone.modulators.push(
-                    new Modulator(
-                        source(cc, CURVES[curve], false, true, bipolar === 1),
-                        gate,
-                        destination,
-                        amount,
-                        0
-                    )
-                );
-            }
-        }
-    }
+const ENV_CURVE_TOLERANCE = 100;
+const ENV_SMALL_TC = 80;
+
+interface SharedCurve {
+    shape: number[];
+    curve: CustomCurve;
 }
 
 /**
- * CC74 and CC71 cutoff curves of one element at one cutoff (converter brightness_fits)
+ * Whole bipolar response shapes of CC72 and CC73 shared bank wide (unit normalised, the amount of each modulator
+ * scales them). The first response that no curve fits within the tolerance starts a new one.
  */
-function addBrightness(zone: BasicZone, b: Brightness) {
-    addControllerResponse(zone, 74, b.fc, [GeneratorTypes.initialFilterFc]);
-    // A soft note starts further below the DLL's cutoff ceiling, so CC74 opens it more
-    for (const [kind, velocityCurve, amount] of b.fc.vel ?? []) {
-        const soft = source(ModulatorControllerSources.noteOnVelocity, CURVES[velocityCurve], true);
-        zone.modulators.push(new Modulator(cc74Source(kind), soft, GeneratorTypes.initialFilterFc, amount, 0));
-    }
-    addControllerResponse(zone, 74, b.att, [GeneratorTypes.initialAttenuation]);
-    addControllerResponse(zone, 71, b.cc71, [GeneratorTypes.initialFilterFc]);
-    // How CC74 maps at the resonance CC71 sets, on top of the curves above (CC71 as the second source)
-    const cc71Sources = {
-        switch: source(71, ModulatorCurveTypes.switch, false, true),
-        linear: source(71, ModulatorCurveTypes.linear, false, true, true),
-        convex: source(71, ModulatorCurveTypes.convex, false, true, true)
-    };
-    for (const [kind, secondary, amount] of b.cross71) {
-        zone.modulators.push(
-            new Modulator(cc74Source(kind), cc71Sources[secondary], GeneratorTypes.initialFilterFc, amount, 0)
+const envCurves = { 72: new Array<SharedCurve>(), 73: new Array<SharedCurve>() };
+
+/**
+ * The attack (CC73) and release (CC72) time response of one element as one modulator per CC, a bipolar custom
+ * curve (exactly 0 at 64) shared with the other instruments.
+ */
+function addEnvelopeCc(zone: BasicZone, env: EnvelopeResponse) {
+    for (const [cc, y, destination] of [
+        [72, env.cc72, GeneratorTypes.releaseVolEnv],
+        [73, env.cc73, GeneratorTypes.attackVolEnv]
+    ] as const) {
+        if (!y) continue;
+        let found: SharedCurve | undefined;
+        let amount = 0;
+        for (const c of envCurves[cc]) {
+            const a: number = y.reduce((sum, v, i) => sum + v * c.shape[i], 0) / c.shape.reduce((sum, v) => sum + v * v, 0);
+            const fits = (v: number, i: number) =>
+                Math.abs(a * c.shape[i] - v) <= (Math.abs(v) < ENV_SMALL_TC ? ENV_CURVE_TOLERANCE / 3 : ENV_CURVE_TOLERANCE);
+            if (y.every(fits)) {
+                found = c;
+                amount = a;
+                break;
+            }
+        }
+        if (!found) {
+            const peak = Math.max(...y.map(Math.abs));
+            const shape = y.map((v) => v / peak);
+            const points = shape.map((v, i) => ({ x: i * 128, y: Math.round(8192 + 8192 * v) }));
+            points.push({ x: 16_383, y: points[127].y });
+            found = { shape, curve: new CustomCurve(points, `cc${cc} ${envCurves[cc].length}`) };
+            envCurves[cc].push(found);
+            amount = peak;
+        }
+        add(zone,
+            new Modulator(
+                new ModulatorSource(cc, found.curve, true, true, false),
+                source(ModulatorControllerSources.noController, 0),
+                destination,
+                Math.round(amount),
+                0
+            )
         );
     }
 }
 
 /**
- * A CC74 source for the velocity and CC71 terms: unipolar switches for the steps (bipolar ones read -1 at 64),
- * bipolar curves otherwise
+ * Largest error in cents the breakpoint cut and the sharing of a curve may each add to the response
  */
-function cc74Source(kind: CC74Curve) {
-    return kind === "stepUp" || kind === "stepDown"
-        ? source(74, ModulatorCurveTypes.switch, kind === "stepDown", true)
-        : source(74, CURVES[kind], false, true, true);
+const CURVE_CUT_CENTS = 25;
+const CURVE_SHARE_CENTS = 25;
+
+/**
+ * Shared cutoff and attenuation curves. Controller shapes (CC74, CC71, exactly 0 at 64) and velocity shapes (no
+ * neutral value) are kept apart, a velocity curve reused for CC74 would move the cutoff at CC74 64 already.
+ */
+const sharedCurves = { controller: new Array<SharedCurve>(), velocity: new Array<SharedCurve>() };
+const curveStats = {
+    cut: new Array<number>(),
+    share: new Array<number>(),
+    points: new Array<number>(),
+    /**
+     * Largest error in cents of each whole modulator (both curves, the cut, the sharing and the rounded amount)
+     * against the converter's response
+     */
+    term: new Array<number>()
+};
+
+/**
+ * Breakpoints (indices) of a 128 value shape that keep the straight lines between them within eps, always with the
+ * ends and the forced indices (the neutral controller value 64)
+ */
+function breakpoints(shape: number[], eps: number, forced: number[]) {
+    const keep = new Set([0, 127, ...forced]);
+    const cut = (lo: number, hi: number) => {
+        let worst = -1;
+        let at = -1;
+        for (let i = lo + 1; i < hi; i++) {
+            const line = shape[lo] + ((shape[hi] - shape[lo]) * (i - lo)) / (hi - lo);
+            const d = Math.abs(shape[i] - line);
+            if (d > worst) {
+                worst = d;
+                at = i;
+            }
+        }
+        if (at >= 0 && worst > eps) {
+            keep.add(at);
+            cut(lo, at);
+            cut(at, hi);
+        }
+    };
+    const sorted = [...keep].sort((a, b) => a - b);
+    for (let i = 0; i + 1 < sorted.length; i++) cut(sorted[i], sorted[i + 1]);
+    return [...keep].sort((a, b) => a - b);
+}
+
+/**
+ * The shared custom curve for a response of the given shape (unit peak) and amount, and the amount to use with it.
+ * The shape is cut to breakpoints first, then matched to a curve of the bank within the sharing tolerance (any
+ * scale), else it becomes a new one.
+ */
+function sharedCurve(shape: number[], amount: number, neutral: number | null) {
+    const eps = CURVE_CUT_CENTS / Math.abs(amount);
+    const idx = breakpoints(shape, eps, neutral === null ? [] : [neutral]);
+    const cut = shape.map((_, i) => {
+        let k = 0;
+        while (idx[k + 1] < i) k++;
+        const lo = idx[k];
+        const hi = idx[Math.min(k + 1, idx.length - 1)];
+        return hi === lo ? shape[lo] : shape[lo] + ((shape[hi] - shape[lo]) * (i - lo)) / (hi - lo);
+    });
+    curveStats.cut.push(Math.max(...cut.map((v, i) => Math.abs(v - shape[i]))) * Math.abs(amount));
+    const pool = neutral === null ? sharedCurves.velocity : sharedCurves.controller;
+    for (const c of pool) {
+        const k = cut.reduce((sum, v, i) => sum + v * c.shape[i], 0) / c.shape.reduce((sum, v) => sum + v * v, 0);
+        const dev = Math.max(...cut.map((v, i) => Math.abs(k * c.shape[i] - v))) * Math.abs(amount);
+        if (dev <= CURVE_SHARE_CENTS) {
+            curveStats.share.push(dev);
+            return { curve: c.curve, shape: c.shape, scale: k };
+        }
+    }
+    const points = idx.map((i) => ({ x: i * 128, y: Math.max(0, Math.min(16_384, Math.round(8192 + 8192 * cut[i]))) }));
+    points.push({ x: 16_383, y: points[points.length - 1].y });
+    const made = { shape: cut, curve: new CustomCurve(points, `${neutral === null ? "velocity" : "controller"} ${pool.length}`) };
+    pool.push(made);
+    curveStats.points.push(points.length);
+    curveStats.share.push(0);
+    return { curve: made.curve, shape: made.shape, scale: 1 };
+}
+
+/**
+ * Notes the largest error of one modulator over both its sources: amount x g x h as the converter has it against
+ * the rounded amount x the two shared curves (h and its curve left out for a one source modulator)
+ */
+function noteTermError(amount: number, g: number[], cg: SharedCurve, rounded: number, h?: number[], ch?: SharedCurve) {
+    let worst = 0;
+    for (let j = 0; j < (h ? 128 : 1); j++) {
+        const want = h ? h[j] : 1;
+        const got = h && ch ? ch.shape[j] : 1;
+        for (let i = 0; i < 128; i++) worst = Math.max(worst, Math.abs(amount * g[i] * want - rounded * cg.shape[i] * got));
+    }
+    curveStats.term.push(worst);
+}
+
+/**
+ * CC74 and CC71 cutoff and attenuation response of one zone: one custom curve per controller and term, velocity (or
+ * CC71) as the second source of the CC74 terms, curves shared bank wide (converter brightness_raw)
+ */
+function addBrightness(zone: BasicZone, b: Brightness) {
+    const none = source(ModulatorControllerSources.noController, 0);
+    const fc = GeneratorTypes.initialFilterFc;
+    for (const [amount, g, h] of b.fc) {
+        const cg = sharedCurve(g, amount, 64);
+        const ch = sharedCurve(h, amount, null);
+        const rounded = Math.round(amount * cg.scale * ch.scale);
+        noteTermError(amount, g, cg, rounded, h, ch);
+        add(zone,
+            new Modulator(
+                new ModulatorSource(74, cg.curve, true, true, false),
+                new ModulatorSource(ModulatorControllerSources.noteOnVelocity, ch.curve, false, true, false),
+                fc,
+                rounded,
+                0
+            )
+        );
+    }
+    if (b.cc71) {
+        const c = sharedCurve(b.cc71[1], b.cc71[0], 64);
+        const rounded = Math.round(b.cc71[0] * c.scale);
+        noteTermError(b.cc71[0], b.cc71[1], c, rounded);
+        add(zone, new Modulator(new ModulatorSource(71, c.curve, true, true, false), none, fc, rounded, 0));
+    }
+    if (b.x71) {
+        const [amount, g, h] = b.x71;
+        const cg = sharedCurve(g, amount, 64);
+        const ch = sharedCurve(h, amount, 64);
+        const rounded = Math.round(amount * cg.scale * ch.scale);
+        noteTermError(amount, g, cg, rounded, h, ch);
+        add(zone,
+            new Modulator(
+                new ModulatorSource(74, cg.curve, true, true, false),
+                new ModulatorSource(71, ch.curve, true, true, false),
+                fc,
+                rounded,
+                0
+            )
+        );
+    }
+    if (b.att) {
+        const c = sharedCurve(b.att[1], b.att[0], 64);
+        noteTermError(b.att[0], b.att[1], c, Math.round(b.att[0] * c.scale));
+        add(zone,
+            new Modulator(
+                new ModulatorSource(74, c.curve, true, true, false),
+                none,
+                GeneratorTypes.initialAttenuation,
+                Math.round(b.att[0] * c.scale),
+                0
+            )
+        );
+    }
 }
 
 const bakedSamples = new Array<BasicSample>();
 const pitchBakes = new Map<string, BasicSample>();
+// A bank.json from before the per value responses (envelope terms per half, brightness curve fits) would lose its
+// envelope CCs or fail halfway, so it stops here
+const staleBrightness = (b: Brightness | null | undefined) => !!b && !Array.isArray(b.fc);
+for (const inst of bank.instruments) {
+    const env = inst.global.envCc;
+    if (
+        (env && [env.cc72, env.cc73].some((y) => y !== null && !Array.isArray(y))) ||
+        staleBrightness(inst.global.brightness) ||
+        inst.zones.some((z) => staleBrightness(z.brightness))
+    ) {
+        throw new Error(`${path.join(dataDir, "bank.json")} is from an older converter, run build.py again`);
+    }
+}
+
 const instruments = bank.instruments.map((inst) => {
     const instrument = new BasicInstrument();
     instrument.name = inst.name;
@@ -529,7 +718,7 @@ const instruments = bank.instruments.map((inst) => {
     addVelocityModulator(g, inst.global.velocity2, GeneratorTypes.initialAttenuation, 1);
     const velocityCurves = [inst.global.velocity, inst.global.velocity2].filter((f) => f).map((f) => f![0]);
     if (velocityCurves.length && !velocityCurves.includes("concave")) {
-        g.modulators.push(
+        add(g,
             new Modulator(
                 source(ModulatorControllerSources.noteOnVelocity, ModulatorCurveTypes.concave, true),
                 source(ModulatorControllerSources.noController, 0),
@@ -553,12 +742,12 @@ const instruments = bank.instruments.map((inst) => {
     const upper = source(71, ModulatorCurveTypes.switch, false, true);
     const lower = source(71, ModulatorCurveTypes.switch, true, true);
     const { up, down } = inst.global.cc71;
-    g.modulators.push(new Modulator(cc71, none, GeneratorTypes.initialFilterQ, up[0], 0));
-    g.modulators.push(new Modulator(cc71, upper, GeneratorTypes.gain, Math.round(up[1]), 0));
+    add(g, new Modulator(cc71, none, GeneratorTypes.initialFilterQ, up[0], 0));
+    add(g, new Modulator(cc71, upper, GeneratorTypes.gain, Math.round(up[1]), 0));
     if (down[0] !== up[0]) {
-        g.modulators.push(new Modulator(cc71, lower, GeneratorTypes.initialFilterQ, down[0] - up[0], 0));
+        add(g, new Modulator(cc71, lower, GeneratorTypes.initialFilterQ, down[0] - up[0], 0));
     }
-    if (down[1]) g.modulators.push(new Modulator(cc71, lower, GeneratorTypes.initialAttenuation, -down[1], 0));
+    if (down[1]) add(g, new Modulator(cc71, lower, GeneratorTypes.initialAttenuation, -down[1], 0));
     // Element LFO. The chip runs one LFO per element for pitch, filter and amplitude, a triangle or a sawtooth that
     // starts at 0 and rising with the element (like the core's LFOs at their default phase). The vibrato LFO
     // carries the element's own pitch depth with its delay and fade-in, the mod LFO (same rate, no delay) the mod
@@ -591,9 +780,9 @@ const instruments = bank.instruments.map((inst) => {
     // the global zone or on each zone (when the zones play at different cutoffs). Without curves the default
     // modulator stays.
     const hasCC74 = (b: Brightness | null | undefined) =>
-        !!b && b.fc.up.length + b.fc.down.length + (b.fc.vel?.length ?? 0) + b.att.up.length + b.att.down.length + b.cross71.length > 0;
+        !!b && b.fc.length + (b.att ? 1 : 0) + (b.x71 ? 1 : 0) > 0;
     if (hasCC74(inst.global.brightness) || inst.zones.some((z) => hasCC74(z.brightness))) {
-        g.modulators.push(
+        add(g,
             new Modulator(source(74, ModulatorCurveTypes.linear, false, true, true), none, GeneratorTypes.initialFilterFc, 0, 0)
         );
     }
@@ -699,7 +888,7 @@ const instruments = bank.instruments.map((inst) => {
             [fcSlope, GeneratorTypes.initialFilterFc]
         ] as const) {
             if (!slope) continue;
-            zone.modulators.push(
+            add(zone,
                 new Modulator(
                     source(ModulatorControllerSources.noteOnKeyNum, ModulatorCurveTypes.linear, false, false, true),
                     source(ModulatorControllerSources.noController, 0),
@@ -746,7 +935,7 @@ const instruments = bank.instruments.map((inst) => {
         }
         gen(zone, GeneratorTypes.releaseVolEnv, z.eg.releaseVolEnv - releaseSlope * (z.centerKey - 64));
         if (releaseSlope) {
-            zone.modulators.push(
+            add(zone,
                 new Modulator(
                     source(ModulatorControllerSources.noteOnKeyNum, ModulatorCurveTypes.linear, false, false, true),
                     source(ModulatorControllerSources.noController, 0),
@@ -795,9 +984,21 @@ for (const p of bank.presets) {
     }
     soundBank.addPresets(preset);
 }
+soundBank.addCustomCurves(...envCurves[72].map((c) => c.curve), ...envCurves[73].map((c) => c.curve), ...[...sharedCurves.controller, ...sharedCurves.velocity].map((c) => c.curve));
+// The new bank's own copies of core's two envelope time curves go with the default modulators that used them
+for (const c of [...soundBank.customCurves]) if (c.useCount === 0) soundBank.deleteCustomCurve(c);
+const percentile = (a: number[], p: number) => [...a].sort((x, y) => x - y)[Math.floor((a.length - 1) * p)] ?? 0;
+console.log(
+    `Custom curves: ${soundBank.customCurves.length} (${envCurves[72].length + envCurves[73].length} envelope, ${sharedCurves.controller.length} controller and ` +
+        `${sharedCurves.velocity.length} velocity, ${curveStats.points.reduce((a, b) => a + b, 0)} points), breakpoint cut error cents median ` +
+        `${percentile(curveStats.cut, 0.5).toFixed(1)} p99 ${percentile(curveStats.cut, 0.99).toFixed(1)} max ${percentile(curveStats.cut, 1).toFixed(1)}, ` +
+        `sharing error median ${percentile(curveStats.share, 0.5).toFixed(1)} p99 ${percentile(curveStats.share, 0.99).toFixed(1)} ` +
+        `max ${percentile(curveStats.share, 1).toFixed(1)}, whole modulator error median ${percentile(curveStats.term, 0.5).toFixed(1)} ` +
+        `p99 ${percentile(curveStats.term, 0.99).toFixed(1)} max ${percentile(curveStats.term, 1).toFixed(1)}`
+);
 soundBank.flush();
 
-const out = soundBank.writeSFE();
+const out = soundBank.writeSFe({ rf64: false });
 fs.writeFileSync(outFile, new Uint8Array(out));
 console.log(
     `Wrote ${outFile}: ${samples.length} samples (+${bakedSamples.length} baked), ${instruments.length} instruments, ${soundBank.presets.length} presets, ${(out.byteLength / 1048576).toFixed(1)} MB`
@@ -844,7 +1045,7 @@ for (let i = 0; i < long.length; i += WORKERS) {
 // After an Ogg stream of odd length that start is half a sample off and the PCM sample reads one byte shifted
 // (noise at 1/50 of the level). With every PCM sample ahead of the compressed ones the offsets stay even.
 soundBank.samples.sort((a, b) => Number(a.isCompressed) - Number(b.isCompressed));
-const vorbis = soundBank.writeSFE();
+const vorbis = soundBank.writeSFe({ rf64: false });
 fs.writeFileSync(vorbisFile, new Uint8Array(vorbis));
 console.log(
     `Wrote ${vorbisFile}: ${long.length} of ${soundBank.samples.length} samples compressed, ${(vorbis.byteLength / 1048576).toFixed(1)} MB`
