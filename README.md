@@ -61,7 +61,7 @@ python3 build.py --dll input/syxg50.dll --output out
 
 On Windows use `copy` and `python build.py ...`, and create the output folder first (`mkdir out`).
 
-This writes `out/syxg50.sf4` and `out/syxg50_vorbis.sf4` (the same bank with longer samples in Ogg Vorbis).
+This writes `out/syxg50.sf4` and `out/syxg50-vorbis.sf4` (the same bank with longer samples in Ogg Vorbis).
 The first run measures every voice in the plugin (under Wine on Linux), which takes a while. The results are kept in
 `build/syxg50/`, so later runs only redo the fitting and writing. `--full` starts from scratch. The slow steps use
 3 worker processes, set `SYXG_JOBS` to change that (for example `SYXG_JOBS=8 python3 build.py ...`).

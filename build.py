@@ -3,7 +3,7 @@
 
 python3 build.py [--dll input/syxg50.dll] [--output .] [--full] [--name "S-YXG50"]
 
-Writes <dll name>.sf4 and <dll name>_vorbis.sf4 to --output (default: the current folder). The data of each DLL
+Writes <dll name>.sf4 and <dll name>-vorbis.sf4 to --output (default: the current folder). The data of each DLL
 (ROM tables, measurements, bank.json) lives in build/<dll name>/, so several DLLs can be built side by side.
 
 Steps, each skipped when its output is already there (--full redoes all of them):

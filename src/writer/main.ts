@@ -248,7 +248,7 @@ const WAVE = fs.readFileSync(path.join(dataDir, "wave.pcm"));
 const bank = JSON.parse(fs.readFileSync(path.join(dataDir, "bank.json"), "utf8")) as BankDescription;
 fs.mkdirSync(outDir, { recursive: true });
 const outFile = path.join(outDir, `${fileName}.sf4`);
-const vorbisFile = path.join(outDir, `${fileName}_vorbis.sf4`);
+const vorbisFile = path.join(outDir, `${fileName}-vorbis.sf4`);
 
 const CURVES: Record<string, ModulatorCurveType> = {
     linear: ModulatorCurveTypes.linear,
