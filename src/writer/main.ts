@@ -354,23 +354,20 @@ soundBank.soundBankInfo.name = bankName;
 soundBank.soundBankInfo.engineer = "syxg2sfe";
 
 // Default modulators (DMOD), changed where the DLL differs from spessasynth_core's defaults:
-// - CC74 (brightness) moves the cutoff 16 DLL units (75 cents) per step, so +-4800 cents instead of +-9600.
 // - CC71 (harmonic content) depends on each element's own resonance, every instrument overrides it.
 // - The mod wheel adds up to +-48 cents (reg 0x481 up to 58) without the element's LFO delay, so it goes to the
 //   mod LFO, which runs at the element's rate with no delay. The element's own vibrato uses the vibrato LFO.
-// - Channel pressure does not touch the LFO in the DLL.
+//   The default's amount source (modulation depth range, 50 cents at the default RPN 5) stays, so the depth follows
+//   RPN 5 and XG's MW LFO PMOD DEPTH. 48 cents at the default range is 48 * 32.
+// Core's CC74 default (+-4800 cents, 16 DLL units or 75 cents per step) already matches. Channel pressure does not
+// touch the LFO in the DLL, and core's defaults have no channel pressure vibrato.
 for (const m of soundBank.defaultModulators) {
     const src = m.primarySource;
-    if (m.destination === GeneratorTypes.vibLfoToPitch) {
-        if (src.isCC && src.index === 1) {
-            m.destination = GeneratorTypes.modLfoToPitch;
-            m.transformAmount = 48;
-        } else if (!src.isCC && src.index === ModulatorControllerSources.channelPressure) {
-            m.transformAmount = 0;
-        }
+    if (m.destination === GeneratorTypes.vibLfoToPitch && src.isCC && src.index === 1) {
+        m.destination = GeneratorTypes.modLfoToPitch;
+        m.transformAmount = 48 * 32;
     }
     if (!src.isCC) continue;
-    if (src.index === 74 && m.destination === GeneratorTypes.initialFilterFc) m.transformAmount = 4800;
     // Core's resonance compensator (CC71 to gain), instruments without their own CC71 terms get none
     if (src.index === 71 && m.destination === GeneratorTypes.gain) m.transformAmount = 0;
 }
@@ -402,8 +399,6 @@ soundBank.addSamples(...samples);
 // about 7 dB quieter than the DLL (the median over all voices), since spessasynth_core cannot boost a zone
 // above 0 cB. 19 cB is the 1st percentile of all zones, so about 1% of zones clamp to 0 cB.
 const LEVEL_REFERENCE_CB = 19;
-// spessasynth_core multiplies the initialAttenuation generator by 0.4 (the EMU quirk), modulators are not scaled
-const EMU_ATTENUATION_FACTOR = 0.4;
 
 /**
  * Sets a generator without the spec range validation.
@@ -444,7 +439,20 @@ function addVelocityModulator(
 }
 
 /**
- * Adds a controller response fitted per half of the controller (step and curve terms, switch gated), so 64
+ * Gate of the upper half: 0 up to 64, 1 from 65. The SFe switch is already on at 64, so it can't gate a step there.
+ */
+const UPPER_HALF = new CustomCurve(
+    [
+        { x: 0, y: 0 },
+        { x: 8256, y: 0 },
+        { x: 8256, y: 16_384 },
+        { x: 16_384, y: 16_384 }
+    ],
+    "upper half"
+);
+
+/**
+ * Adds a controller response fitted per half of the controller (step and curve terms, gated to their half), so 64
  * leaves the zone as it is.
  */
 function addControllerResponse(
@@ -459,7 +467,11 @@ function addControllerResponse(
         ["up", fit.up],
         ["down", fit.down]
     ] as const) {
-        const gate = source(cc, ModulatorCurveTypes.switch, half === "down", true);
+        // The negative switch is on up to 63
+        const gate =
+            half === "up"
+                ? new ModulatorSource(cc as ModulatorSource["index"], UPPER_HALF, true, false, false)
+                : source(cc, ModulatorCurveTypes.switch, true, true);
         for (const [curve, amount] of terms) {
             for (const d of destinations) {
                 add(zone,
@@ -873,8 +885,8 @@ const instruments = bank.instruments.map((inst) => {
             zone,
             GeneratorTypes.initialAttenuation,
             attSlope
-                ? (z.attenuation - LEVEL_REFERENCE_CB - attSlope * (z.centerKey - 64)) / EMU_ATTENUATION_FACTOR
-                : Math.max(0, z.attenuation - LEVEL_REFERENCE_CB) / EMU_ATTENUATION_FACTOR
+                ? (z.attenuation - LEVEL_REFERENCE_CB - attSlope * (z.centerKey - 64))
+                : Math.max(0, z.attenuation - LEVEL_REFERENCE_CB)
         );
         if (z.pan !== 0) gen(zone, GeneratorTypes.pan, z.pan);
         if (z.exclusiveClass) gen(zone, GeneratorTypes.exclusiveClass, z.exclusiveClass);
@@ -984,7 +996,7 @@ for (const p of bank.presets) {
     }
     soundBank.addPresets(preset);
 }
-soundBank.addCustomCurves(...envCurves[72].map((c) => c.curve), ...envCurves[73].map((c) => c.curve), ...[...sharedCurves.controller, ...sharedCurves.velocity].map((c) => c.curve));
+soundBank.addCustomCurves(UPPER_HALF, ...envCurves[72].map((c) => c.curve), ...envCurves[73].map((c) => c.curve), ...[...sharedCurves.controller, ...sharedCurves.velocity].map((c) => c.curve));
 // The new bank's own copies of core's two envelope time curves go with the default modulators that used them
 for (const c of [...soundBank.customCurves]) if (c.useCount === 0) soundBank.deleteCustomCurve(c);
 const percentile = (a: number[], p: number) => [...a].sort((x, y) => x - y)[Math.floor((a.length - 1) * p)] ?? 0;
