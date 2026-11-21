@@ -66,7 +66,7 @@ The first run measures every voice in the plugin (under Wine on Linux), which ta
 `build/syxg50/`, so later runs only redo the fitting and writing. `--full` starts from scratch. The slow steps use
 3 worker processes, set `SYXG_JOBS` to change that (for example `SYXG_JOBS=8 python3 build.py ...`).
 
-The banks are SFe 4 files and need spessasynth_core 4.4.11 or newer to play right. They use its generators (see
+The banks are SFe 4 files and need spessasynth_core 4.4.12 or newer to play right. They use its generators (see
 Design choices) and its custom modulator curves. An older player ignores what it does not know, so pitch envelopes,
 second decays, delayed elements, drum notes and the CC71 to 74 responses play wrong there.
 

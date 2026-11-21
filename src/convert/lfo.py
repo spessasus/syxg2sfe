@@ -93,6 +93,12 @@ def delay_and_fade(byte8, fade, d, cc78=64, cc77=64):
     return n * TICK + 0.01, up * TICK
 
 
+def source_x(v):
+    """A 7-bit value (velocity, CC) as the modulator source sees it, 0..1, center-max (SFe 7.2): 64 is exactly
+    the center and 127 exactly the end."""
+    return v / 128 if v <= 64 else 0.5 + (v - 64) / 126
+
+
 def _curve(name, v):
     """spessasynth_core's unipolar curves (modulator_curves.ts), v in 0..1."""
     if name == 'linear': return v
@@ -104,7 +110,8 @@ def _curve(name, v):
 
 def fit_halves(f, base, tol=1.0):
     """Fits f(cc) - base on each half of the controller (the other half and 64 stay at 0) as a sum of SF2 switch
-    gated terms: a step plus slopes on linear, convex and concave curves of (cc - 64) / 64. Takes the smallest set
+    gated terms: a step plus slopes on linear, convex and concave curves of the bipolar source value (64 is 0, 0 is -1
+    and 127 is 1). Takes the smallest set
     (step always in) whose RMS is within tol of the best. Returns {'up': [[curve, amount], ..], 'down': ..} with
     curve 'step', 'linear', 'convex' or 'concave'."""
     import itertools
@@ -119,7 +126,7 @@ def fit_halves(f, base, tol=1.0):
             continue
         cols = {'step': np.ones(len(ccs))}
         for name in ('linear', 'convex', 'concave'):
-            cols[name] = np.array([math.copysign(_curve(name, abs(c - 64) / 64), c - 64) for c in ccs])
+            cols[name] = np.array([math.copysign(_curve(name, abs(2 * source_x(c) - 1)), c - 64) for c in ccs])
         fits = []
         for k in range(0, 3):
             for combo in itertools.combinations(('linear', 'convex', 'concave'), k):
@@ -180,6 +187,6 @@ def lfo_for(el, amp_delay=0.0):
 # Mod wheel (CC1): reg = max(element depth, PMOD_REG[CC1 * 80 >> 10]). The bank adds it on the mod LFO instead
 # (no delay, the element's rate), so this is the linear modulator amount for the default modulator list.
 def mod_wheel_amount():
-    xs = [c / 128 for c in range(128)]
+    xs = [source_x(c) for c in range(128)]
     ys = [depth_cents(PMOD_REG[c * 80 >> 10]) for c in range(128)]
     return round(sum(x * y for x, y in zip(xs, ys)) / sum(x * x for x in xs))

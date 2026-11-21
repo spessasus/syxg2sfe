@@ -354,7 +354,8 @@ soundBank.soundBankInfo.name = bankName;
 soundBank.soundBankInfo.engineer = "syxg2sfe";
 
 // Default modulators (DMOD), changed where the DLL differs from spessasynth_core's defaults:
-// - CC71 (harmonic content) depends on each element's own resonance, every instrument overrides it.
+// - CC71 (harmonic content) depends on each element's own resonance, every instrument carries its own terms, so
+//   core's CC71 defaults go.
 // - The mod wheel adds up to +-48 cents (reg 0x481 up to 58) without the element's LFO delay, so it goes to the
 //   mod LFO, which runs at the element's rate with no delay. The element's own vibrato uses the vibrato LFO.
 //   The default's amount source (modulation depth range, 50 cents at the default RPN 5) stays, so the depth follows
@@ -367,16 +368,14 @@ for (const m of soundBank.defaultModulators) {
         m.destination = GeneratorTypes.modLfoToPitch;
         m.transformAmount = 48 * 32;
     }
-    if (!src.isCC) continue;
-    // Core's resonance compensator (CC71 to gain), instruments without their own CC71 terms get none
-    if (src.index === 71 && m.destination === GeneratorTypes.gain) m.transformAmount = 0;
 }
 // - Envelope time CCs. The DLL has no CC75 (decay) and moves the attack and release EG rates of each voice by its own
 //   amounts, so core's defaults for CC72, CC73 and CC75 go and every instrument carries its own (addEnvelopeCc).
 const envelopeDestinations: GeneratorType[] = [GeneratorTypes.attackVolEnv, GeneratorTypes.releaseVolEnv, GeneratorTypes.decayVolEnv];
-soundBank.defaultModulators = soundBank.defaultModulators.filter(
-    (m) => !([72, 73, 75].includes(m.primarySource.isCC ? m.primarySource.index : -1) && envelopeDestinations.includes(m.destination))
-);
+soundBank.defaultModulators = soundBank.defaultModulators.filter((m) => {
+    const cc = m.primarySource.isCC ? m.primarySource.index : -1;
+    return cc !== 71 && !([72, 73, 75].includes(cc) && envelopeDestinations.includes(m.destination));
+});
 
 const samples = bank.samples.map((s) => {
     const loopStart = s.attack;
@@ -439,7 +438,15 @@ function addVelocityModulator(
 }
 
 /**
- * Gate of the upper half: 0 up to 64, 1 from 65. The SFe switch is already on at 64, so it can't gate a step there.
+ * Where a 7-bit controller value sits on a custom curve, center-max (SFe 7.2): 64 is 8192 and 127 is 16384
+ */
+function sourceX(v: number) {
+    return v <= 64 ? v * 128 : Math.round(8192 + (8192 * (v - 64)) / 63);
+}
+
+/**
+ * Gate of the upper half: 0 up to 64, 1 from 65 (8192 and 8322). The SFe switch is already on at 64, so it can't
+ * gate a step there.
  */
 const UPPER_HALF = new CustomCurve(
     [
@@ -528,8 +535,7 @@ function addEnvelopeCc(zone: BasicZone, env: EnvelopeResponse) {
         if (!found) {
             const peak = Math.max(...y.map(Math.abs));
             const shape = y.map((v) => v / peak);
-            const points = shape.map((v, i) => ({ x: i * 128, y: Math.round(8192 + 8192 * v) }));
-            points.push({ x: 16_383, y: points[127].y });
+            const points = shape.map((v, i) => ({ x: sourceX(i), y: Math.round(8192 + 8192 * v) }));
             found = { shape, curve: new CustomCurve(points, `cc${cc} ${envCurves[cc].length}`) };
             envCurves[cc].push(found);
             amount = peak;
@@ -621,8 +627,8 @@ function sharedCurve(shape: number[], amount: number, neutral: number | null) {
             return { curve: c.curve, shape: c.shape, scale: k };
         }
     }
-    const points = idx.map((i) => ({ x: i * 128, y: Math.max(0, Math.min(16_384, Math.round(8192 + 8192 * cut[i]))) }));
-    points.push({ x: 16_383, y: points[points.length - 1].y });
+    // Index 127 is always a breakpoint and sits at 16384, the end of the curve
+    const points = idx.map((i) => ({ x: sourceX(i), y: Math.max(0, Math.min(16_384, Math.round(8192 + 8192 * cut[i]))) }));
     const made = { shape: cut, curve: new CustomCurve(points, `${neutral === null ? "velocity" : "controller"} ${pool.length}`) };
     pool.push(made);
     curveStats.points.push(points.length);
@@ -744,11 +750,10 @@ const instruments = bank.instruments.map((inst) => {
     addVelocityModulator(g, inst.global.velocityFc, GeneratorTypes.initialFilterFc, -1);
     addVelocityModulator(g, inst.global.velocityFc2, GeneratorTypes.initialFilterFc, -1);
     addVelocityModulator(g, inst.global.velocityQ, GeneratorTypes.initialFilterQ, -1);
-    // CC71. The upper half uses the default resonant modulator's exact source (bipolar CC71, no secondary), so it
-    // overrides it. The level that rises with the resonance goes on the gain generator, which sits after the
-    // attenuation clamp and can boost. It has the identity of core's default compensator (CC71 linear bipolar plus
-    // CC71 switch), so it replaces that one and carries the whole measured gain. A second modulator (switch
-    // secondary) reshapes the lower half.
+    // CC71 (no default modulator, see the DMOD changes). The resonance goes on initialFilterQ, which lowers the
+    // level with the Q like the SF2 filter. The level that rises with the resonance goes on the gain generator,
+    // which sits after the attenuation clamp and can boost, and carries the whole measured gain. A second modulator
+    // (switch secondary) reshapes the lower half.
     const cc71 = source(71, ModulatorCurveTypes.linear, false, true, true);
     const none = source(ModulatorControllerSources.noController, 0);
     const upper = source(71, ModulatorCurveTypes.switch, false, true);

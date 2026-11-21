@@ -12,7 +12,7 @@ from paths import MEASURE, MEASURE_VEL, BANK, FILTER_MAP, JOBS, wave_base
 from fegfit import fit as fit_filter_eg, vol_env_db
 from presets import melodic, KITS, KIT_NAMES, wave_records
 from chip import *
-from lfo import lfo_for, fit_halves
+from lfo import lfo_for, fit_halves, source_x
 from functools import lru_cache
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -217,15 +217,14 @@ VEL_CURVES = {
 }
 
 def vel_x(curve, v):
-    """Negative velocity modulator value relative to velocity 127. spessasynth_core reads velocity v as v / 128,
-    so velocity 127 still gives a bit of the curve (12 % for convex)."""
-    f = VEL_CURVES[curve]
-    return f(1 - v / 128) - f(1 / 128)
+    """Negative velocity modulator value relative to velocity 127, which is 0 since 127 is the end of the source
+    range (SFe 7.2)."""
+    return VEL_CURVES[curve](1 - source_x(v))
 
 def vel_at127(fit, ref=127):
     """What a velocity modulator still adds at velocity 127 (or at ref, the top velocity of an element with a
     velocity range), in its destination's units."""
-    return VEL_CURVES[fit[0]](1 - ref / 128) * fit[1] if fit else 0.0
+    return VEL_CURVES[fit[0]](1 - source_x(ref)) * fit[1] if fit else 0.0
 
 def fit_velocity(points, ref=127):
     """points: [(velocity, extra attenuation cB relative to velocity ref)] -> (curve, amount) for a negative
